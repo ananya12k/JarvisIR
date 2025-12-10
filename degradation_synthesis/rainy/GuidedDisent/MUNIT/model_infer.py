@@ -15,7 +15,7 @@ class MUNIT_infer(nn.Module):
     def forward(self, inputs_a):
 
         s_b = torch.randn(inputs_a.size(0), self.style_dim, 1, 1).cuda()
-        c_a, _ = self.gen_a.encode(inputs_a)
+        c_a,    _ = self.gen_a.encode(inputs_a)
         x_ab = self.gen_b.decode(c_a, s_b)
         return x_ab
 
