@@ -1,0 +1,6 @@
+variant,num_frames,avg_delta_psnr,avg_delta_ssim,avg_psnr_restored_vs_gt,avg_ssim_restored_vs_gt,rank_delta_psnr,rank_delta_ssim,rank_psnr_restored,rank_ssim_restored,mean_rank
+combo_volumetric_blur__heterogeneous_density__secondary_scattering__fog_coupled_noise,900,5.090334,0.127298,14.001329,0.894846,9,18,13,5,11.2500
+combo_volumetric_blur__heterogeneous_density__nonlinear_gamma__secondary_scattering__fog_coupled_noise,900,5.075760,0.127583,13.928344,0.894193,11,17,16,9,13.2500
+combo_volumetric_blur__heterogeneous_density__fog_coupled_noise,900,4.861774,0.124485,13.928476,0.894462,18,23,15,7,15.7500
+combo_volumetric_blur__heterogeneous_density__nonlinear_gamma__fog_coupled_noise,900,4.843653,0.124739,13.853424,0.893804,19,22,21,11,18.2500
+combo_volumetric_blur__heterogeneous_density__secondary_scattering,900,5.019472,0.122081,13.928961,0.889582,15,27,14,21,19.2500

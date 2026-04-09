@@ -55,7 +55,7 @@ class ImageProcessor:
         self.pipe = pipeline(
             task="depth-estimation", 
             model=model_name,
-            device=self.device
+            device=self   .device
         )
         print("Depth estimation model loaded successfully")
         

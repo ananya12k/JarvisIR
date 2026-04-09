@@ -1,0 +1,76 @@
+Fog Ablation Analysis Summary
+Run: fog_ablation_20260408_205849
+Frames evaluated: 900
+
+1) Overall takeaway
+The results show that no single degradation setting is best on every metric. There is a clear tradeoff between:
+- improvement over the degraded input (avg_delta_psnr, avg_delta_ssim)
+- final restored quality (avg_psnr_restored_vs_gt, avg_ssim_restored_vs_gt)
+
+If the goal is the best balanced configuration, the strongest variant is:
+- combo_volumetric_blur__heterogeneous_density__secondary_scattering__fog_coupled_noise
+This variant has the best overall mean rank in the ranking table (mean_rank = 11.25) and stays consistently strong across both improvement and restored-quality metrics.
+
+2) Best-performing combinations
+Top ranked by mean_rank:
+- combo_volumetric_blur__heterogeneous_density__secondary_scattering__fog_coupled_noise
+  mean_rank = 11.25
+- combo_volumetric_blur__heterogeneous_density__nonlinear_gamma__secondary_scattering__fog_coupled_noise
+  mean_rank = 13.25
+- combo_volumetric_blur__heterogeneous_density__fog_coupled_noise
+  mean_rank = 15.75
+- combo_volumetric_blur__heterogeneous_density__nonlinear_gamma__fog_coupled_noise
+  mean_rank = 18.25
+- combo_volumetric_blur__heterogeneous_density__secondary_scattering
+  mean_rank = 19.25
+
+Best restored quality among the listed combinations:
+- combo_volumetric_blur__heterogeneous_density__secondary_scattering__adaptive_airlight__fog_coupled_noise
+  avg_psnr_restored_vs_gt = 14.363127
+  avg_ssim_restored_vs_gt = 0.903764
+- combo_volumetric_blur__heterogeneous_density__adaptive_airlight__fog_coupled_noise
+  avg_psnr_restored_vs_gt = 14.256339
+  avg_ssim_restored_vs_gt = 0.902898
+- combo_volumetric_blur__heterogeneous_density__nonlinear_gamma__adaptive_airlight__fog_coupled_noise
+  avg_psnr_restored_vs_gt = 14.178493
+  avg_ssim_restored_vs_gt = 0.902238
+- combo_volumetric_blur__heterogeneous_density__secondary_scattering__adaptive_airlight
+  avg_psnr_restored_vs_gt = 14.187855
+  avg_ssim_restored_vs_gt = 0.894716
+
+3) What the numbers mean
+- Volumetric blur and heterogeneous density appear in almost every top configuration. This suggests they are the most important degradations in this ablation.
+- Secondary scattering also helps strongly when combined with volumetric blur and heterogeneous density.
+- Fog-coupled noise improves the overall ranking in several cases, but it does not always produce the highest final PSNR/SSIM by itself.
+- Nonlinear gamma helps, but it is usually less dominant than volumetric blur, heterogeneous density, and secondary scattering.
+- Adaptive airlight is useful for raising final restored PSNR/SSIM, especially in the strongest multi-factor combinations.
+
+4) Single-degradation observations
+Among the single degradation settings:
+- combo_volumetric_blur gives the best restored PSNR among single-factor settings (13.390082) and the best restored SSIM (0.883441).
+- combo_adaptive_airlight is close behind in restored PSNR (13.361957) and SSIM (0.874884).
+- combo_secondary_scattering and combo_nonlinear_gamma are weaker in final restored quality than volumetric blur or adaptive airlight.
+- combo_fog_coupled_noise is useful, but by itself it is not as strong as the best single-factor options.
+
+5) Recommended conclusion
+The ablation indicates that the restoration pipeline performs best when it handles coupled structural fog effects first, especially volumetric blur and heterogeneous density. Secondary scattering is the next most valuable factor, while fog-coupled noise and nonlinear gamma provide additional but smaller gains. Adaptive airlight is most effective when combined with the stronger fog components, where it improves final restored quality.
+
+Final conclusion: the most reliable overall configuration for this fog ablation is the combination of volumetric blur + heterogeneous density + secondary scattering + fog-coupled noise, while the highest final restoration quality is achieved when adaptive airlight is also included in the strongest multi-factor setting.
+
+6) Comparison with fog_synthesis.py
+The current fog_synthesis.py implementation is more complex than the top-ranked ablation variant. Its active ingredients are:
+- VDA depth guidance for transmission estimation
+- heterogeneous density via fBm-based beta_field
+- nonlinear gamma on depth-dependent transmission
+- volumetric blur
+- adaptive airlight / correlated airlight
+- secondary scattering via road_glow
+- fog-coupled noise
+
+In ablation-label form, this is closest to:
+- combo_volumetric_blur__heterogeneous_density__nonlinear_gamma__secondary_scattering__adaptive_airlight__fog_coupled_noise
+
+So the script is not using the exact best-ranked combination. The best mean-rank variant in the table is the same combination without nonlinear_gamma and adaptive_airlight:
+- combo_volumetric_blur__heterogeneous_density__secondary_scattering__fog_coupled_noise
+
+However, the script's extra adaptive_airlight and nonlinear_gamma terms are useful if the goal is to maximize final restored PSNR/SSIM, because the strongest restored-quality settings in the table include adaptive_airlight.
