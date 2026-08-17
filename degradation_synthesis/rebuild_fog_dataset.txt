@@ -1,0 +1,49 @@
+==========================================
+SLURM_JOB_ID = 2643323
+SLURM_NODELIST = gnode095
+SLURM_JOB_GPUS = 0,1,2,3
+==========================================
+=== Stage 1: copying GT + Semantic subsets ===
+train/00: 2344 available -> 2344 selected
+train/04: 2245 available -> 2245 selected
+train/05: 2000 available -> 2000 selected
+train/07: 2000 available -> 2000 selected
+train/08: 2250 available -> 2250 selected
+train/09: 1312 available -> 1312 selected
+train/GH019007: 9179 available -> 3500 selected
+train/GH019008: 9090 available -> 3500 selected
+train/GH019009: 1709 available -> 1709 selected
+train/GH019014: 7688 available -> 3500 selected
+val/01: 2000 available -> 2000 selected
+val/02: 2245 available -> 2245 selected
+val/GH019005: 1866 available -> 1866 selected
+val/GH019009: 302 available -> 302 selected
+test/03: 2000 available -> 2000 selected
+test/09: 563 available -> 563 selected
+
+Total GT/Semantic frames copied: 33336
+Plan saved to /scratch/Ananya_Kulkarni/Defog_balanced_fixed/frame_plan.json
+Beta assignments saved to /scratch/Ananya_Kulkarni/Defog_balanced_fixed/beta_plan.json
+
+=== Stage 2: full-factorial Haze generation (multi-GPU) ===
+Detected 4 visible GPU(s): [0, 1, 2, 3]
+Total scene tasks: 16 (x4 levels each)
+[GPU 0] done train/05 (2000 frames x 4 levels)
+[GPU 2] done train/07 (2000 frames x 4 levels)
+[GPU 3] done train/04 (2245 frames x 4 levels)
+[GPU 1] done train/00 (2344 frames x 4 levels)
+[GPU 2] done train/09 (1312 frames x 4 levels)
+[GPU 0] done train/08 (2250 frames x 4 levels)
+[GPU 2] done train/GH019009 (1709 frames x 4 levels)
+[GPU 3] done train/GH019007 (3500 frames x 4 levels)
+[GPU 1] done train/GH019008 (3500 frames x 4 levels)
+[GPU 2] done val/01 (2000 frames x 4 levels)
+[GPU 2] done val/GH019009 (302 frames x 4 levels)
+[GPU 1] done val/GH019005 (1866 frames x 4 levels)
+[GPU 0] done train/GH019014 (3500 frames x 4 levels)
+[GPU 3] done val/02 (2245 frames x 4 levels)
+[GPU 1] done test/09 (563 frames x 4 levels)
+[GPU 2] done test/03 (2000 frames x 4 levels)
+ALL DONE
+
+=== Done. Dataset at /scratch/Ananya_Kulkarni/Defog_balanced_fixed ===

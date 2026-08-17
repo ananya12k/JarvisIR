@@ -80,10 +80,8 @@ def prepare_split_gt():
     return split_folders
 
 def worker(gpu_id, task_queue):
-    """Stage 2: Process fog rendering per split folder."""
-    print(f"🚀 Worker started on GPU {gpu_id}")
-    
-    # Hide other GPUs from this process
+    print(f"Worker started on GPU {gpu_id}")
+
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
@@ -93,37 +91,45 @@ def worker(gpu_id, task_queue):
         except:
             break
 
-        input_folder = task['input'] # This is the GT folder
-        beta = task['beta']
-        hurst = task['hurst']
-        intensity = task['intensity']
-        
+        input_folder = task['input']
+        beta         = task['beta']
+        hurst        = task['hurst']
+        intensity    = task['intensity']
+
         video_part_name = os.path.basename(input_folder)
-        
-        # Final output name includes parameters for dataset tracking
-        output_name = f"{video_part_name}_{intensity}_B{beta:.3f}_H{hurst:.2f}"
-        output_folder = os.path.join(OUTPUT_ROOT, output_name)
+        output_name     = f"{video_part_name}_{intensity}_B{beta:.3f}_H{hurst:.2f}"
+        output_folder   = os.path.join(OUTPUT_ROOT, output_name)
         os.makedirs(output_folder, exist_ok=True)
 
-        print(f"[GPU {gpu_id}] Rendering: {video_part_name} | β={beta:.3f} H={hurst:.2f}")
+        print(f"[GPU {gpu_id}] Rendering: {video_part_name} | "
+              f"β={beta:.3f} H={hurst:.2f}")
 
-        # Construct Command
         cmd = [
             "python", SCRIPT_PATH,
-            "--input", input_folder,
-            "--output", output_folder,
-            "--beta", str(beta),
-            "--hurst", str(hurst),
-            "--gpu_id", "0", # Always 0 because we masked with CUDA_VISIBLE_DEVICES
+            "--input",   input_folder,
+            "--output",  output_folder,
+            "--beta",    str(beta),
+            "--hurst",   str(hurst),
+            "--gpu_id",  "0",
             "--encoder", "vits"
         ]
 
         try:
             subprocess.run(cmd, check=True, env=env)
-            print(f"✅ Finished: {output_name}")
+            # Confirm both foggy and gt_toned were created
+            gt_toned_dir = os.path.join(output_folder, 'gt_toned')
+            n_foggy  = len(glob.glob(os.path.join(output_folder, '*.png')) +
+                           glob.glob(os.path.join(output_folder, '*.jpg')))
+            n_gt     = len(glob.glob(os.path.join(gt_toned_dir,  '*.png')) +
+                           glob.glob(os.path.join(gt_toned_dir,  '*.jpg')))
+            print(f"  Done: {output_name} | "
+                  f"foggy={n_foggy} frames | gt_toned={n_gt} frames")
+            if n_foggy != n_gt:
+                print(f"  WARNING: frame count mismatch — "
+                      f"foggy={n_foggy} gt={n_gt}")
         except subprocess.CalledProcessError:
-            print(f"❌ Failed: {video_part_name}")
-
+            print(f"  FAILED: {video_part_name}")
+            
 if __name__ == "__main__":
     # Stage 1: Split the data
     gt_folders = prepare_split_gt()
