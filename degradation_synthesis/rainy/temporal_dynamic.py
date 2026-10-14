@@ -192,6 +192,14 @@ class TemporalDynamicRain:
         self.gs = wc.get('grid_scale', 4)
         self.wet = np.zeros((math.ceil(height / self.gs), math.ceil(width / self.gs)), np.float32)
         self._wet_gx = np.zeros_like(self.wet)
+        self.riv = np.zeros_like(self.wet)                 # R5: flowing rivulet water (grid units)
+        gh, gw = self.wet.shape
+        self._gy, self._gx = np.mgrid[0:gh, 0:gw].astype(np.float32)
+        # static noise texture advected with the flow -> visible moving ripples
+        tex_rng = np.random.default_rng(int(self.rng.integers(0, 2 ** 31 - 1))) if cfg.get('rivulets', {}).get('enabled', False) else None
+        self._flow_tex = (cv2.GaussianBlur(tex_rng.random((height, width)).astype(np.float32), (0, 0), 3.0)
+                          if tex_rng is not None else None)
+        self._flow_phase = 0.0
         self.profile = defaultdict(float) if cfg.get('profile', False) else None
 
         gen = torch.Generator(device=self.device)
@@ -422,6 +430,7 @@ class TemporalDynamicRain:
         if wp and self.frame_index > 0 and self.frame_index % wp == 0:
             self.droplets, self.trails, self.ghosts = [], [], []
             self.wet[:] = 0
+            self.riv[:] = 0
         self.stats['removed'] = before - len(self.droplets)
         for s in self.trails:
             s.age += 1
@@ -438,6 +447,7 @@ class TemporalDynamicRain:
         self.handle_merging()
         self.remove_expired()
         self.update_wetness()
+        self.update_rivulets()
         for d in self.droplets:
             d.age += 1
         self._update_easing()
@@ -512,6 +522,54 @@ class TemporalDynamicRain:
         self._wet_gx = np.gradient(sm, axis=1).astype(np.float32)
         self.stats['wet_coverage'] = float((self.wet > wc['reuse_threshold']).mean())
 
+    def update_rivulets(self):
+        """R5: where the wet-path memory exceeds a threshold, the excess becomes
+        flowing rivulet water: advected downward (thicker = faster), spread slightly
+        sideways, drained, and it keeps its own track wet. Sliding drops that reach a
+        rivulet can join it (their volume feeds the flow; the bead fades into it)."""
+        rc = self.cfg.get('rivulets', {})
+        if not rc.get('enabled', False):
+            return
+        # wet-path excess feeds the flow
+        excess = np.maximum(self.wet - rc['threshold'], 0) * rc['transfer']
+        self.wet -= excess
+        self.riv += excess
+        # drops reaching a rivulet join it
+        joined = 0
+        keep = []
+        for d in self.droplets:
+            if d.state == 'sliding':
+                cy, cx = self._cell(d.x, d.y + d.radius)
+                if self.riv[cy, cx] > rc['join_threshold'] and self.rng.random() < rc['join_prob']:
+                    rr = max(1, int(round(d.radius / self.gs)))
+                    splat = np.zeros_like(self.riv)
+                    cv2.circle(splat, (cx, cy), rr, 1.0, -1)
+                    splat = cv2.GaussianBlur(splat, (0, 0), max(0.5, rr / 2))
+                    self.riv += splat * (d.volume * rc['join_gain'] / max(splat.sum(), 1e-6))
+                    d.ghost_target, d.ease_left = -1, max(1, self.cfg['merge'].get('ease_frames', 0))
+                    d.rox, d.roy = 0.0, 0.0
+                    self.ghosts.append(d)          # fades out in place
+                    joined += 1
+                    continue
+            keep.append(d)
+        self.droplets = keep
+        # semi-Lagrangian advection: speed grows with thickness
+        v = rc['speed'] * np.clip(self.riv / rc['ref_level'], 0.3, 1.5)
+        self.riv = cv2.remap(self.riv, self._gx, self._gy - v, cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        # sideways spreading (more water -> wider), drainage
+        spread = cv2.GaussianBlur(self.riv, (0, 0), sigmaX=rc['spread_sigma'], sigmaY=0.01)
+        self.riv = (1 - rc['spread']) * self.riv + rc['spread'] * spread
+        self.riv *= (1.0 - rc['drain'])
+        self.wet = np.maximum(self.wet, np.minimum(self.riv * rc['wet_keep'], rc['threshold']))
+        self._flow_phase += rc['speed'] * self.gs
+        # a rivulet = well-used wet channel (continuous) + water flowing along it (pulses)
+        vis = (self.riv > rc['visible_level']) | (self.wet > rc['channel_level'])
+        self.stats['rivulet_coverage'] = float(vis.mean())
+        n, _, cst, _ = cv2.connectedComponentsWithStats(vis.astype(np.uint8), connectivity=8)
+        self.stats['rivulet_paths'] = int((cst[1:, cv2.CC_STAT_AREA] >= rc['min_path_cells']).sum())
+        self.stats['drops_joined'] = joined
+
     def _update_easing(self):
         """Advance merge easing: drawn offsets / hidden volume of survivors shrink to
         zero; ghosts move onto their target's drawn position while shrinking and fading."""
@@ -528,7 +586,7 @@ class TemporalDynamicRain:
             if g.ease_left <= 0:
                 continue
             k = 1.0 / g.ease_left
-            t = by_id.get(g.ghost_target)
+            t = by_id.get(g.ghost_target) if g.ghost_target >= 0 else None
             if t is not None:                   # flow towards where the survivor is drawn
                 g.rox += (t.rx - g.rx) * k
                 g.roy += (t.ry - g.ry) * k
@@ -714,6 +772,34 @@ class TemporalDynamicRain:
         self._tick('drops_composite', t0)
         return v_map, m_map
 
+    def _height_layer(self, h, normal_gain, thickness, alpha):
+        """Thin water as a height field h (HxW, torch): normals from its gradient
+        (refraction strongest on the flanks), alpha from its height."""
+        gy = torch.zeros_like(h)
+        gx = torch.zeros_like(h)
+        gy[1:-1] = (h[2:] - h[:-2]) / 2
+        gx[:, 1:-1] = (h[:, 2:] - h[:, :-2]) / 2
+        g = torch.stack([gy, gx])
+        gn = g.norm(dim=0, keepdim=True)
+        n = g / (gn + 1e-6) * (gn * normal_gain).clamp(max=1.0)
+        v = torch.cat([-n, torch.full_like(h[None], thickness)], 0)
+        m = (h[None] * alpha).clamp(0, 1)
+        return v, m
+
+    def _rivulet_maps(self):
+        rc = self.cfg.get('rivulets', {})
+        if not rc.get('enabled', False):
+            return None
+        H, W = self.height, self.width
+        flow = np.clip(np.maximum(self.riv - rc['visible_level'], 0) / rc['ref_level'], 0, 1.5)
+        channel = np.clip((self.wet - rc['channel_level']) / (rc['threshold'] - rc['channel_level'] + 1e-6), 0, 1) * rc['channel_gain']
+        h = cv2.resize(np.maximum(flow, channel), (W, H), interpolation=cv2.INTER_CUBIC)
+        # flowing ripples: noise texture scrolled down with the flow
+        tex = np.roll(self._flow_tex, int(self._flow_phase) % H, axis=0)
+        h = h * (1 - rc['ripple'] + rc['ripple'] * 2 * tex)
+        h = torch.from_numpy(cv2.GaussianBlur(h.astype(np.float32), (0, 0), 1.0)).to(self.device)
+        return self._height_layer(h, rc['normal_gain'], rc['thickness'], rc['alpha'])
+
     def render_maps(self):
         """Current droplets + trails -> (v 1xHxWx3, mask 1xHxWx1) on self.device."""
         v_d, m_d = self._render_droplets()
@@ -723,6 +809,15 @@ class TemporalDynamicRain:
         use_drop = m_d >= m_t
         v = torch.where(use_drop, v_d, v_t)
         m = torch.where(use_drop, m_d, m_t)
+        # further water layers (rivulets, film): same rule, the strongest coverage wins
+        t0 = self._tick(None, None)
+        for layer in (self._rivulet_maps(),):
+            if layer is not None:
+                v_l, m_l = layer
+                keep = m >= m_l
+                v = torch.where(keep, v, v_l)
+                m = torch.where(keep, m, m_l)
+        self._tick('rivulets', t0)
         self.stats['coverage'] = float((m > 0.05).float().mean())
         return v.permute(1, 2, 0).unsqueeze(0), m.permute(1, 2, 0).unsqueeze(0)
 

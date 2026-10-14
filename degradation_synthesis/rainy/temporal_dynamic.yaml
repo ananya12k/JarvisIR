@@ -86,6 +86,28 @@ base:
       threshold_relief: 0.3   # slide threshold x (1 - relief * wetness)
       reuse_threshold: 0.2    # wetness counted as "existing wet path"
 
+  rivulets:                   # R5: connected flowing water on the wetness grid (on for heavy / torrential)
+    enabled: false
+    threshold: 0.8            # wet-path level above which water starts to flow
+    transfer: 0.3             # fraction of the excess moved into the flow per frame
+    speed: 1.5                # cells / frame at ref_level (x grid_scale px)
+    ref_level: 1.0
+    spread: 0.15              # sideways spreading per frame
+    spread_sigma: 1.0
+    drain: 0.02
+    wet_keep: 0.5             # a rivulet keeps its track wet
+    join_threshold: 0.3       # rivulet level at which sliding drops can join it
+    join_prob: 0.2            # per frame
+    join_gain: 0.004          # drop volume -> rivulet level
+    visible_level: 0.15
+    channel_level: 0.45       # wet-path level drawn as a (continuous) rivulet channel
+    channel_gain: 0.6         # channel height relative to flowing water
+    min_path_cells: 6         # connected components smaller than this are not counted as paths
+    ripple: 0.35              # flowing texture modulation
+    normal_gain: 3.0
+    thickness: 0.18
+    alpha: 0.6
+
   merge:
     overlap_frac: 0.70        # merge when centre distance < frac * (r1 + r2); lower = stricter (ablation B5)
     impact_growth: true       # a new drop landing inside a bead feeds it (no merge event / position jump)
@@ -119,6 +141,7 @@ scenarios:
     growth: {rate: 0.03}
     motion: {slide_radius: 12.0, max_speed: 6.0, activation_prob: 0.25}
     trails: {lifetime_frames: 45, width_frac: 0.45}
+    rivulets: {enabled: true}
 
   torrential:                 # dense accumulation; connected flow (later stages add rivulets + film)
     spawn:
@@ -130,3 +153,4 @@ scenarios:
     growth: {rate: 0.04}
     motion: {slide_radius: 11.0, max_speed: 7.0, activation_prob: 0.35}
     trails: {lifetime_frames: 60, width_frac: 0.5}
+    rivulets: {enabled: true, threshold: 0.6, transfer: 0.4, speed: 2.0, spread: 0.25}
