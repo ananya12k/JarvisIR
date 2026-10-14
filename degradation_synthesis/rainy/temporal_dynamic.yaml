@@ -153,7 +153,11 @@ scenarios:
       size_mixture:
         - {weight: 0.90, median: 4.0, sigma: 0.45}
         - {weight: 0.10, median: 10.0, sigma: 0.30}
-    growth: {rate: 0.012}
+    # growth / evaporation balance radius = rate / evaporation = 1.2 px < min_radius, so
+    # little-sliding beads slowly evaporate instead of piling up (flat coverage over 35 s)
+    growth: {rate: 0.006, evaporation: 0.005}
+    remove: {min_radius: 2.2}
+    warmup_frames: 900
     motion: {slide_radius: 16.0, max_speed: 3.0, activation_prob: 0.10}
     trails: {lifetime_frames: 20, width_frac: 0.30}
 
