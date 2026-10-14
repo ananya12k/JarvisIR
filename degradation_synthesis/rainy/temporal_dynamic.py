@@ -200,6 +200,26 @@ class TemporalDynamicRain:
         self._flow_tex = (cv2.GaussianBlur(tex_rng.random((height, width)).astype(np.float32), (0, 0), 3.0)
                           if tex_rng is not None else None)
         self._flow_phase = 0.0
+        # R6 water film: thickness grid + evolving sheet pattern + large-scale flow texture
+        self.film = np.zeros_like(self.wet)
+        fc = cfg.get('film', {})
+        if fc.get('enabled', False):
+            frng = np.random.default_rng(int(self.rng.integers(0, 2 ** 31 - 1)))
+
+            def smooth_noise(shape, sigma):
+                # periodic (seamless when scrolled): pad by wrapping, blur, crop
+                pad = int(3 * sigma) + 1
+                n = np.pad(frng.random(shape).astype(np.float32), pad, mode='wrap')
+                n = cv2.GaussianBlur(n, (0, 0), sigma)[pad:-pad, pad:-pad]
+                return (n - n.mean()) / (n.std() + 1e-6)
+            # two large-scale sheet patterns scrolled at different speeds -> evolving patches
+            self._sheet_a = smooth_noise(self.wet.shape, fc['sheet_scale'])
+            self._sheet_b = smooth_noise(self.wet.shape, fc['sheet_scale'] * 0.6)
+            self._sheet_t = 0.0
+            tex = cv2.GaussianBlur(frng.random((height, width)).astype(np.float32), (0, 0), fc['texture_scale'])
+            self._film_tex = (tex - tex.min()) / (tex.max() - tex.min() + 1e-6)
+            self._film_phase = 0.0
+        self._arrivals = []
         self.profile = defaultdict(float) if cfg.get('profile', False) else None
 
         gen = torch.Generator(device=self.device)
@@ -245,6 +265,7 @@ class TemporalDynamicRain:
         n = int(self.rng.poisson(lam))
         impact = self.cfg['merge'].get('impact_growth', False)
         impacts = 0
+        self._arrivals = []
         for _ in range(n):
             r = self._sample_radius()
             x, y = float(self.rng.uniform(0, self.width)), float(self.rng.uniform(0, self.height))
@@ -259,8 +280,10 @@ class TemporalDynamicRain:
                 if hit.size:
                     self.droplets[int(hit[np.argmin(dd[hit])])].volume += r ** 3
                     impacts += 1
+                    self._arrivals.append((x, y, r))
                     continue
             self.droplets.append(self._new_droplet(x, y, r ** 3))
+            self._arrivals.append((x, y, r))
         self.stats['arrivals'] = n
         self.stats['impacts'] = impacts
 
@@ -431,6 +454,7 @@ class TemporalDynamicRain:
             self.droplets, self.trails, self.ghosts = [], [], []
             self.wet[:] = 0
             self.riv[:] = 0
+            self.film[:] = 0
         self.stats['removed'] = before - len(self.droplets)
         for s in self.trails:
             s.age += 1
@@ -448,6 +472,7 @@ class TemporalDynamicRain:
         self.remove_expired()
         self.update_wetness()
         self.update_rivulets()
+        self.update_film()
         for d in self.droplets:
             d.age += 1
         self._update_easing()
@@ -570,6 +595,50 @@ class TemporalDynamicRain:
         self.stats['rivulet_paths'] = int((cst[1:, cv2.CC_STAT_AREA] >= rc['min_path_cells']).sum())
         self.stats['drops_joined'] = joined
 
+    def update_film(self):
+        """R6: thin water film h(x, y). Sources: evolving sheet pattern (below),
+        impact splats, rivulet overflow. Flow: semi-Lagrangian downward advection with
+        speed ~ (h / h_ref)^2 (thin film creeps, thick film sheets down), sideways
+        spreading by Gaussian blending (both steps unconditionally stable), drainage
+        off the bottom edge, evaporation."""
+        fc = self.cfg.get('film', {})
+        if not fc.get('enabled', False):
+            return
+        # where sheets form: an evolving large-scale pattern (two noise fields scrolling
+        # down at different speeds); the film relaxes towards a sheet in the top
+        # `coverage` fraction of it -> patchy, moving sheets with controllable coverage
+        self._sheet_t += 1.0
+        gh, gw = self.film.shape
+        def scroll(n, dy, dx):
+            return cv2.remap(n, (self._gx - dx) % gw, (self._gy - dy) % gh, cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
+        pat = (0.65 * scroll(self._sheet_a, self._sheet_t * fc['sheet_speed'], 0.0)
+               + 0.35 * scroll(self._sheet_b, self._sheet_t * fc['sheet_speed'] * 1.7, self._sheet_t * fc['sheet_drift']))
+        cov = min(max(fc['coverage'] * self.rain_intensity, 0.0), 0.95)
+        tau = np.quantile(pat, 1.0 - cov) if cov > 0 else np.inf
+        target = fc['h_sheet'] * np.clip((pat - tau) / fc['sheet_edge'], 0, 1)
+        self.film += fc['relax'] * (target - self.film)
+        if self._arrivals:
+            sp = np.zeros_like(self.film)
+            for (x, y, r) in self._arrivals:
+                cy, cx = self._cell(x, y)
+                cv2.circle(sp, (cx, cy), max(1, int(round(r * fc['splash_radius'] / self.gs))), fc['impact_source'], -1)
+            self.film += cv2.GaussianBlur(sp, (0, 0), 1.0)
+        rc = self.cfg.get('rivulets', {})
+        if rc.get('enabled', False):
+            over = np.maximum(self.riv - fc['overflow_level'], 0) * fc['overflow_transfer']
+            self.riv -= over
+            self.film += over
+        v = fc['speed'] * np.clip(self.film / fc['h_ref'], 0, 2) ** 2
+        self.film = cv2.remap(self.film, self._gx, self._gy - v, cv2.INTER_LINEAR,
+                              borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        spread = cv2.GaussianBlur(self.film, (0, 0), fc['spread_sigma'])
+        self.film = (1 - fc['spread']) * self.film + fc['spread'] * spread
+        self.film *= (1.0 - fc['evaporation'])
+        self.film = np.minimum(self.film, fc['h_max'])
+        self._film_phase += fc['speed'] * self.gs * float(np.clip(self.film.mean() / fc['h_ref'], 0, 2) ** 2)
+        self.stats['film_coverage'] = float((self.film > fc['visible_level']).mean())
+        self.stats['film_mean'] = float(self.film.mean())
+
     def _update_easing(self):
         """Advance merge easing: drawn offsets / hidden volume of survivors shrink to
         zero; ghosts move onto their target's drawn position while shrinking and fading."""
@@ -598,9 +667,24 @@ class TemporalDynamicRain:
         self.ghosts = keep
 
     def warmup(self, frames):
-        """Run the simulation before the first output frame so the clip doesn't start dry."""
+        """Run the simulation before the first output frame so the clip doesn't start dry.
+        The film relaxes much more slowly than the drops, so it then gets an extra
+        film-only pre-warm (cheap, coarse grid) to start at its steady state."""
         for _ in range(frames):
             self.step()
+        fc = self.cfg.get('film', {})
+        if fc.get('enabled', False) and fc.get('prewarm_frames', 0) > 0:
+            # impacts sampled from a separate RNG so the drop simulation stream is untouched
+            prng = np.random.default_rng(int(self.rng.integers(0, 2 ** 31 - 1)))
+            lam = self.cfg['spawn']['rate_per_second'] * self.rain_intensity / self.cfg['fps']
+            saved = self._arrivals
+            self._sheet_t -= fc['prewarm_frames']      # pattern ends the pre-warm where the clip starts
+            for _ in range(fc['prewarm_frames']):
+                n = prng.poisson(lam)
+                self._arrivals = [(prng.uniform(0, self.width), prng.uniform(0, self.height),
+                                   self.cfg['spawn']['radius_min'] * 2) for _ in range(n)]
+                self.update_film()
+            self._arrivals = saved
 
     # ------------------------------------------------------------------ rendering
     def _tick(self, key, t0):
@@ -800,6 +884,19 @@ class TemporalDynamicRain:
         h = torch.from_numpy(cv2.GaussianBlur(h.astype(np.float32), (0, 0), 1.0)).to(self.device)
         return self._height_layer(h, rc['normal_gain'], rc['thickness'], rc['alpha'])
 
+    def _film_maps(self):
+        fc = self.cfg.get('film', {})
+        if not fc.get('enabled', False):
+            return None
+        H, W = self.height, self.width
+        h = cv2.resize(np.maximum(self.film - fc['visible_level'], 0) / fc['h_ref'], (W, H), interpolation=cv2.INTER_CUBIC)
+        # broad, evolving distortion: large-scale texture scrolled with the mean flow
+        tex = np.roll(self._film_tex, int(self._film_phase) % H, axis=0)
+        h = np.clip(h, 0, 2) * (1 - fc['ripple'] + 2 * fc['ripple'] * tex)
+        h = torch.from_numpy(cv2.GaussianBlur(h.astype(np.float32), (0, 0), 2.0)).to(self.device)
+        v, m = self._height_layer(h, fc['normal_gain'], fc['thickness'], fc['alpha'])
+        return v, m.clamp(max=fc['max_alpha'])
+
     def render_maps(self):
         """Current droplets + trails -> (v 1xHxWx3, mask 1xHxWx1) on self.device."""
         v_d, m_d = self._render_droplets()
@@ -811,13 +908,13 @@ class TemporalDynamicRain:
         m = torch.where(use_drop, m_d, m_t)
         # further water layers (rivulets, film): same rule, the strongest coverage wins
         t0 = self._tick(None, None)
-        for layer in (self._rivulet_maps(),):
+        for layer in (self._rivulet_maps(), self._film_maps()):
             if layer is not None:
                 v_l, m_l = layer
                 keep = m >= m_l
                 v = torch.where(keep, v, v_l)
                 m = torch.where(keep, m, m_l)
-        self._tick('rivulets', t0)
+        self._tick('rivulets_film', t0)
         self.stats['coverage'] = float((m > 0.05).float().mean())
         return v.permute(1, 2, 0).unsqueeze(0), m.permute(1, 2, 0).unsqueeze(0)
 
