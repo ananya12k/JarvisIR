@@ -916,7 +916,9 @@ class TemporalDynamicRain:
                 m = torch.where(keep, m, m_l)
         self._tick('rivulets_film', t0)
         self.stats['coverage'] = float((m > 0.05).float().mean())
-        return v.permute(1, 2, 0).unsqueeze(0), m.permute(1, 2, 0).unsqueeze(0)
+        self.stats['trail_coverage'] = float((m_t > 0.05).float().mean())
+        self.last_maps = (v.permute(1, 2, 0).unsqueeze(0), m.permute(1, 2, 0).unsqueeze(0))
+        return self.last_maps
 
     def _trail_maps(self):
         """Trails as a separate thin water film: a height field drawn from the

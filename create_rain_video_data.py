@@ -172,6 +172,72 @@ class FlickerMeter:
         return self.total / max(self.n, 1)
 
 
+# categorical series colours (dataviz skill reference palette, fixed slot order)
+SERIES_COLORS = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300', '#6250d6', '#e34948']
+
+
+def field_frame(v, mk):
+    """Refraction field as colour: hue = offset direction, brightness = offset size
+    (px), weighted by the water mask. v: 1xHxWx3, mk: 1xHxWx1 (torch)."""
+    H, W = v.shape[1:3]
+    off = (-v[0, :, :, :2] * v[0, :, :, 2:3]).cpu().numpy()          # normalised (row, col)
+    dy, dx = off[..., 0] * H / 2, off[..., 1] * W / 2                 # pixels
+    mag = np.hypot(dx, dy)
+    ang = (np.degrees(np.arctan2(dy, dx)) % 360) / 2                   # OpenCV hue 0..180
+    val = np.clip(mag / 60.0, 0, 1) * np.clip(mk[0, :, :, 0].cpu().numpy() * 2, 0, 1)
+    hsv = np.stack([ang, np.full_like(ang, 255), val * 255], -1).astype(np.uint8)
+    out = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+    cv2.putText(out, 'refraction field: hue = direction, brightness = offset (0-60 px) x water mask',
+                (8, H - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1)
+    return out
+
+
+def track_frame(img, drops, hist):
+    """Overlay drop tracks: pinned = blue, sliding = orange; last ~20 drawn positions."""
+    out = img.copy()
+    col = {'pinned': (214, 120, 42), 'sliding': (52, 104, 235)}       # BGR of slots 1 / 2
+    for (i, x, y, r, state) in drops:
+        pts = hist.get(i, [])
+        for a, b in zip(pts[:-1], pts[1:]):
+            cv2.line(out, (int(a[0]), int(a[1])), (int(b[0]), int(b[1])), col['sliding'], 1, cv2.LINE_AA)
+        cv2.circle(out, (int(x), int(y)), max(2, int(r)), col[state], 1, cv2.LINE_AA)
+    cv2.putText(out, 'tracks: blue = pinned, orange = sliding (+ last 20 positions)', (8, 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+    return out
+
+
+def plot_diagnostics(path, title, coverage, frame_ms, modes):
+    """Two small multiples on their own y-axes (never dual-axis): water coverage per
+    frame and runtime per frame, one line per mode, legend + direct end labels."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    ink, muted, grid, surface = '#1f1f1e', '#6b6b66', '#e6e5e0', '#fcfcfb'
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.2), facecolor=surface)
+    for ax, data, ylab in ((axes[0], coverage, 'water coverage (fraction of frame)'),
+                           (axes[1], frame_ms, 'runtime per frame (ms)')):
+        ax.set_facecolor(surface)
+        for k, m in enumerate(modes):
+            y = data[m]
+            c = SERIES_COLORS[k % len(SERIES_COLORS)]
+            ax.plot(np.arange(len(y)), y, color=c, lw=2, label=m.replace('temporal_dynamic_', 'dynamic: '))
+        ax.set_xlabel('frame', color=muted)
+        ax.set_ylabel(ylab, color=muted)
+        ax.grid(True, color=grid, lw=0.8)
+        ax.set_axisbelow(True)
+        for sp in ('top', 'right'):
+            ax.spines[sp].set_visible(False)
+        for sp in ('left', 'bottom'):
+            ax.spines[sp].set_color(grid)
+        ax.tick_params(colors=muted)
+        ax.set_ylim(bottom=0)
+    axes[1].legend(loc='upper left', bbox_to_anchor=(1.01, 1.0), frameon=False, labelcolor=ink)
+    fig.suptitle(title, color=ink, x=0.01, ha='left')
+    fig.tight_layout()
+    fig.savefig(path, dpi=110, facecolor=surface)
+    plt.close(fig)
+
+
 def summarize_dynamic(log):
     """Per-clip summary of a temporal_dynamic per-frame stats log: mean of every
     numeric field, max of every `max_*` field, totals of event counts."""
@@ -265,6 +331,8 @@ def worker(rank, jobs, args):
         meters = {'gt': FlickerMeter()}
         coverage = {}
         mode_time = {m: 0.0 for m in modes}
+        frame_ms = {m: [] for m in modes}           # per frame, cond0 only
+        cur = {'cond': None}
         mode_peak = {m: 0.0 for m in modes}
         for name in cond_names:
             for k in modes + ['wet_indep', 'wet_clip_style']:
@@ -287,6 +355,12 @@ def worker(rank, jobs, args):
                                               (pw * cols, ph * rows))
             for m in ['GT'] + modes:
                 writers[m] = cv2.VideoWriter(os.path.join(vid_dir, f'{m}.mp4'), fourcc, args.fps, (w4, h4))
+            if args.diagnostics:
+                for m in dyn_modes:
+                    sc = m[len('temporal_dynamic_'):]
+                    writers[f'tracks/{m}'] = cv2.VideoWriter(os.path.join(vid_dir, f'tracks_{sc}.mp4'), fourcc, args.fps, (w4, h4))
+                    writers[f'field/{m}'] = cv2.VideoWriter(os.path.join(vid_dir, f'field_{sc}.mp4'), fourcc, args.fps, (w4, h4))
+        track_hist = {m: {} for m in dyn_modes}
 
         def timed(m, fn):
             torch.cuda.synchronize(device)
@@ -295,6 +369,8 @@ def worker(rank, jobs, args):
             out = fn()
             torch.cuda.synchronize(device)
             mode_time[m] += time.perf_counter() - t0
+            if cur['cond'] == cond_names[0]:
+                frame_ms[m].append(1000 * (time.perf_counter() - t0))
             mode_peak[m] = max(mode_peak[m], torch.cuda.max_memory_allocated(device) / 1e9)
             return out
 
@@ -310,6 +386,7 @@ def worker(rank, jobs, args):
                 content, _ = munit.gen_a.encode(x)
                 for name in cond_names:
                     c = clips[name]
+                    cur['cond'] = name
                     # Level 1: fresh style per frame
                     styles = []
                     for p in batch_paths:
@@ -321,6 +398,7 @@ def worker(rank, jobs, args):
 
                     outs = {m: [] for m in modes}
                     dyn_masks = []
+                    diag = {m: [] for m in dyn_modes}
                     for j, p in enumerate(batch_paths):
                         t = i + j
                         kw = dict(sigma=c['sigma'], transparency=one)
@@ -356,6 +434,10 @@ def worker(rank, jobs, args):
                             outs[m].append(o)
                             if m == dyn_modes[-1]:
                                 dyn_masks.append(mk)
+                            if args.diagnostics and name == cond_names[0] and i + j < args.preview_frames:
+                                vmap, _ = sim.last_maps
+                                drops = [(d.id, d.rx, d.ry, d.render_radius, d.state) for d in sim.droplets]
+                                diag[m].append((field_frame(vmap, mk), drops))
                             coverage[f'{name}/{m}'].append(sim.stats['coverage'])
                             c['sim_logs'][m].append({'frame': os.path.basename(p), **sim.stats})
                     outs = {m: torch.cat(v, 0) for m, v in outs.items()}
@@ -388,13 +470,31 @@ def worker(rank, jobs, args):
                                 cv2.putText(tile, label, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                             tiles += [np.zeros_like(tiles[0])] * (rows * cols - len(tiles))
                             writers['grid'].write(np.vstack([np.hstack(tiles[r * cols:(r + 1) * cols]) for r in range(rows)]))
+                            if args.diagnostics:
+                                for m in dyn_modes:
+                                    fimg, drops = diag[m][j]
+                                    hist = track_hist[m]
+                                    for (di, x, y, _, _) in drops:
+                                        hist.setdefault(di, []).append((x, y))
+                                        del hist[di][:-20]
+                                    alive = {d[0] for d in drops}
+                                    for di in [k for k in hist if k not in alive]:
+                                        del hist[di]
+                                    writers[f'tracks/{m}'].write(track_frame(full[m], drops, hist))
+                                    writers[f'field/{m}'].write(fimg)
             pbar.update(b)
         pbar.close()
         for wr in writers.values():
             wr.release()
 
-        gt_flicker = meters['gt'].value()
         n_frames = len(img_paths)
+        if args.diagnostics:
+            os.makedirs(os.path.join(args.out_base, 'plots'), exist_ok=True)
+            plot_diagnostics(os.path.join(args.out_base, 'plots', f'{split}_{seq_id}.png'),
+                             f'{split}/{seq_id} ({cond_names[0]}): water coverage and runtime per frame',
+                             {m: coverage[f'{cond_names[0]}/{m}'] for m in modes},
+                             frame_ms, modes)
+        gt_flicker = meters['gt'].value()
         stats = {'gt_mean_abs_frame_diff': gt_flicker, 'num_frames': n_frames,
                  'ms_per_frame_per_cond': {m: 1000 * mode_time[m] / (n_frames * len(cond_names)) for m in modes},
                  'peak_gpu_gb': mode_peak}
@@ -444,6 +544,8 @@ def main():
     parser.add_argument('--sim_seed', type=int, default=None,
                         help='Reseed only the temporal_dynamic simulator (everything else keeps --seed)')
     parser.add_argument('--fps', type=int, default=30, help='Output video frame rate')
+    parser.add_argument('--diagnostics', action='store_true',
+                        help='Per scenario (cond0): track-overlay + refraction-field videos, coverage/runtime plot')
     parser.add_argument('--save_wet', action='store_true', help='Also save the MUNIT-only wet frames')
     args = parser.parse_args()
 
