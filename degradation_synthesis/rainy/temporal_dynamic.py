@@ -83,6 +83,13 @@ class Droplet:
     shape_phase: float = 0.0
     shape_rate: float = 0.0
     asym: float = 0.0                   # left/right width asymmetry (OU, larger when sliding)
+    # R3 smooth merges: rendered = physical + offset, easing to zero over ease_left frames
+    rox: float = 0.0
+    roy: float = 0.0
+    vol_deficit: float = 0.0            # merged-in volume not yet shown (grows in visibly)
+    ease_left: int = 0
+    alpha_scale: float = 1.0            # < 1 only for fading merge ghosts
+    ghost_target: int = -1              # merge ghost: id of the drop it is flowing into
 
     @property
     def radius(self):
@@ -90,7 +97,20 @@ class Droplet:
 
     @property
     def opacity(self):
-        return min(1.0, (self.age + 1) / max(1, self.fade_in_frames))
+        return min(1.0, (self.age + 1) / max(1, self.fade_in_frames)) * self.alpha_scale
+
+    # what the renderer draws (== physical state unless a merge is easing in)
+    @property
+    def rx(self):
+        return self.x + self.rox
+
+    @property
+    def ry(self):
+        return self.y + self.roy
+
+    @property
+    def render_radius(self):
+        return max(self.volume - self.vol_deficit, 1e-3) ** (1.0 / 3.0)
 
 
 @dataclass
@@ -162,7 +182,9 @@ class TemporalDynamicRain:
         self.frame_index = 0
         self.stats = {}
         self._prev_pos = {}
+        self._prev_rpos = {}
         self._merged_ids = set()
+        self.ghosts: List[Droplet] = []
         self.profile = defaultdict(float) if cfg.get('profile', False) else None
 
         gen = torch.Generator(device=self.device)
@@ -342,6 +364,7 @@ class TemporalDynamicRain:
             big, small = (a, b) if a.volume >= b.volume else (b, a)
             v = a.volume + b.volume
             bx, by = big.x, big.y
+            brx, bry = big.rx, big.ry          # where it is currently drawn
             big.x = (a.x * a.volume + b.x * b.volume) / v
             big.y = (a.y * a.volume + b.y * b.volume) / v
             big.vx = (a.vx * a.volume + b.vx * b.volume) / v
@@ -353,6 +376,16 @@ class TemporalDynamicRain:
             alive[j if big is a else i] = False
             merges += 1
             shifts.append(math.hypot(big.x - bx, big.y - by))
+            ease = self.cfg['merge'].get('ease_frames', 0)
+            if ease > 0:
+                # physics jumps to the volume-weighted centre; the drawing eases there,
+                # and the absorbed drop visibly flows into the survivor as a fading ghost
+                big.rox, big.roy = brx - big.x, bry - big.y
+                big.vol_deficit = big.vol_deficit + small.volume
+                big.ease_left = ease
+                small.rox, small.roy = small.rx - small.x, small.ry - small.y
+                small.ghost_target, small.ease_left = big.id, ease
+                self.ghosts.append(small)
             self._merged_ids.add(big.id)
         self.droplets = [d for d, keep in zip(self.droplets, alive) if keep]
         self.stats['merges'] = merges
@@ -367,7 +400,7 @@ class TemporalDynamicRain:
                          and d.y < self.height + 3 * d.radius]
         wp = rm.get('wiper_period')
         if wp and self.frame_index > 0 and self.frame_index % wp == 0:
-            self.droplets, self.trails = [], []
+            self.droplets, self.trails, self.ghosts = [], [], []
         self.stats['removed'] = before - len(self.droplets)
         for s in self.trails:
             s.age += 1
@@ -385,6 +418,7 @@ class TemporalDynamicRain:
         self.remove_expired()
         for d in self.droplets:
             d.age += 1
+        self._update_easing()
 
         # track continuity: largest per-frame jump of any surviving id
         pos = {d.id: (d.x, d.y) for d in self.droplets}
@@ -394,6 +428,18 @@ class TemporalDynamicRain:
         motion = [math.hypot(x - self._prev_pos[i][0], y - self._prev_pos[i][1])
                   for i, (x, y) in pos.items() if i in self._prev_pos and i not in self._merged_ids]
         self.stats['max_motion_jump'] = float(max(motion)) if motion else 0.0
+        # what the viewer sees: jump of the DRAWN position (includes merge easing)
+        rpos = {d.id: (d.rx, d.ry) for d in self.droplets}
+        rj = [math.hypot(x - self._prev_rpos[i][0], y - self._prev_rpos[i][1])
+              for i, (x, y) in rpos.items() if i in self._prev_rpos]
+        self.stats['max_render_jump'] = float(max(rj)) if rj else 0.0
+        # jerk: drawn displacement NOT explained by the drop's own velocity this frame
+        # (fast sliding is legitimate motion; merges / teleports show up here)
+        jerk = [math.hypot(d.rx - self._prev_rpos[d.id][0] - d.vx, d.ry - self._prev_rpos[d.id][1] - d.vy)
+                for d in self.droplets if d.id in self._prev_rpos]
+        self.stats['max_render_jerk'] = float(max(jerk)) if jerk else 0.0
+        self._prev_rpos = rpos
+        self.stats['ghosts'] = len(self.ghosts)
         self.stats['persisting'] = len(jumps)
         rads = np.array([d.radius for d in self.droplets]) if self.droplets else np.zeros(1)
         self.stats['median_area'] = float(np.median(math.pi * rads ** 2))
@@ -406,6 +452,33 @@ class TemporalDynamicRain:
         self.stats['active'] = len(self.droplets)
         self.stats['trail_segments'] = len(self.trails)
         self.frame_index += 1
+
+    def _update_easing(self):
+        """Advance merge easing: drawn offsets / hidden volume of survivors shrink to
+        zero; ghosts move onto their target's drawn position while shrinking and fading."""
+        by_id = {d.id: d for d in self.droplets}
+        for d in self.droplets:
+            if d.ease_left > 0:
+                k = 1.0 / d.ease_left
+                d.rox -= d.rox * k
+                d.roy -= d.roy * k
+                d.vol_deficit -= d.vol_deficit * k
+                d.ease_left -= 1
+        keep = []
+        for g in self.ghosts:
+            if g.ease_left <= 0:
+                continue
+            k = 1.0 / g.ease_left
+            t = by_id.get(g.ghost_target)
+            if t is not None:                   # flow towards where the survivor is drawn
+                g.rox += (t.rx - g.rx) * k
+                g.roy += (t.ry - g.ry) * k
+            g.volume *= (1.0 - k)
+            g.alpha_scale *= (1.0 - k)
+            g.ease_left -= 1
+            if g.ease_left > 0:
+                keep.append(g)
+        self.ghosts = keep
 
     def warmup(self, frames):
         """Run the simulation before the first output frame so the clip doesn't start dry."""
@@ -497,17 +570,17 @@ class TemporalDynamicRain:
         H, W, dev = self.height, self.width, self.device
         v_map = torch.zeros(3, H, W, device=dev)
         m_map = torch.zeros(1, H, W, device=dev)
-        drops = sorted(self.droplets, key=lambda d: d.volume)   # rank = volume order
+        drops = sorted(self.droplets + self.ghosts, key=lambda d: d.volume)   # rank = volume order
         if not drops:
             return v_map, m_map
         sh = self.cfg['shape']
         f32 = dict(device=dev, dtype=torch.float32)
-        r = torch.tensor([d.radius for d in drops], **f32)
+        r = torch.tensor([d.render_radius for d in drops], **f32)
         st = torch.tensor([d.stretch for d in drops], **f32)
         ux = torch.tensor([d.dir_x for d in drops], **f32)
         uy = torch.tensor([d.dir_y for d in drops], **f32)
-        xs = torch.tensor([d.x for d in drops], **f32)
-        ys = torch.tensor([d.y for d in drops], **f32)
+        xs = torch.tensor([d.rx for d in drops], **f32)
+        ys = torch.tensor([d.ry for d in drops], **f32)
         th = torch.tensor([d.thickness for d in drops], **f32)
         op = torch.tensor([d.opacity for d in drops], **f32)
         idx = torch.tensor([d.template for d in drops], device=dev)

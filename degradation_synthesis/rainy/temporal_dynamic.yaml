@@ -79,6 +79,7 @@ base:
     overlap_frac: 0.70        # merge when centre distance < frac * (r1 + r2); lower = stricter (ablation B5)
     impact_growth: true       # a new drop landing inside a bead feeds it (no merge event / position jump)
     bead_clearance: true      # shed beads are placed clear of the parent so they don't re-merge at once
+    ease_frames: 5            # R3: drawn position / size ease to the merged state over N frames (0 = instant)
 
   remove:
     min_radius: 1.0
