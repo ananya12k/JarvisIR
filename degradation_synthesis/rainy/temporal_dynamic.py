@@ -78,6 +78,11 @@ class Droplet:
     wobble: float = 0.0                 # lateral OU state (px / frame)
     fade_in_frames: int = 4
     trail_width_jitter: float = 1.0
+    # R2 shape evolution: blend template -> template_b as shape_phase goes 0 -> pi
+    template_b: int = 0
+    shape_phase: float = 0.0
+    shape_rate: float = 0.0
+    asym: float = 0.0                   # left/right width asymmetry (OU, larger when sliding)
 
     @property
     def radius(self):
@@ -103,7 +108,7 @@ def make_shape_templates(num, res, shape_threshold, generator, device):
     """Procedural single-drop templates, same maths as DropModel.get_drop_stock()
     (which builds them at 256x256 and immediately pads them to full frames).
 
-    Returns tmpl (num x 3 x res x res): channels (n_row, n_col, mask), plus each
+    Returns tmpl (num x 4 x res x res): channels (n_row, n_col, mask, field), plus each
     template's blob centre and radius in grid_sample's normalised [-1, 1] units.
     """
     coords = torch.stack(torch.meshgrid(torch.arange(res), torch.arange(res), indexing='ij'), -1)
@@ -120,8 +125,11 @@ def make_shape_templates(num, res, shape_threshold, generator, device):
     v = -torch.cat((k, interp), -1)
     v = v / v.norm(dim=-1, keepdim=True)
     mask = (t > shape_threshold).float()
+    # continuous field t - threshold, clamped and offset to [0, 2] so zero padding
+    # outside the template reads as "far outside the drop" (-1) after subtracting 1
+    field = (t - shape_threshold).clamp(-1, 1) + 1
 
-    tmpl = torch.stack([v[..., 0], v[..., 1], mask], 1)                             # num x 3 x res x res
+    tmpl = torch.stack([v[..., 0], v[..., 1], mask, field], 1)                      # num x 4 x res x res
 
     area = mask.sum(dim=(1, 2)).clamp(min=1)
     rows = torch.arange(res, device=device).float().view(1, res, 1)
@@ -174,6 +182,10 @@ class TemporalDynamicRain:
             state=state, fade_in_frames=c['spawn']['fade_in_frames'],
             trail_width_jitter=float(self.rng.uniform(0.7, 1.3)),
         )
+        if c['shape'].get('evolve', False):
+            d.template_b = int(self.rng.integers(0, c['shape']['num_templates']))
+            d.shape_rate = float(self.rng.uniform(*c['shape']['shape_rate']))
+            d.shape_phase = float(self.rng.uniform(0, math.pi))
         self.next_id += 1
         return d
 
@@ -285,7 +297,16 @@ class TemporalDynamicRain:
     def update_shapes(self):
         """Stretch and orientation follow speed / direction smoothly, never re-randomised."""
         sh = self.cfg['shape']
+        evolve = sh.get('evolve', False)
         for d in self.droplets:
+            if evolve:
+                sliding = d.state == 'sliding'
+                d.shape_phase += d.shape_rate * (sh['slide_shape_boost'] if sliding else 1.0)
+                if d.shape_phase >= math.pi:          # fully at template_b: make it the base
+                    d.shape_phase -= math.pi
+                    d.template, d.template_b = d.template_b, int(self.rng.integers(0, sh['num_templates']))
+                noise = sh['asym_noise'] * (sh['asym_sliding_mult'] if sliding else 1.0)
+                d.asym = float(np.clip(d.asym * 0.95 + self.rng.normal(0, noise), -sh['asym_max'], sh['asym_max']))
             speed = math.hypot(d.vx, d.vy)
             target = 1.0 + min(sh['stretch_gain'] * speed, sh['max_stretch'] - 1.0)
             d.stretch += (target - d.stretch) * sh['stretch_smooth']
@@ -403,11 +424,14 @@ class TemporalDynamicRain:
             self.profile[key] += t - t0
         return t
 
-    def _drop_patches(self, sel, P, r, st, ux, uy, xs, ys, th, op, idx):
+    def _drop_patches(self, sel, P, r, st, ux, uy, xs, ys, th, op, idx, ev=None):
         """Sample the deformed template of drops `sel` into P x P patches centred on
-        each drop. Returns coverage pm (n x P x P) and v pv (n x 3 x P x P)."""
+        each drop. Returns coverage pm (n x P x P) and v pv (n x 3 x P x P).
+        ev: optional R2 shape-evolution tensors (idx_b, w, asym, neck), per drop."""
         sh, dev = self.cfg['shape'], self.device
         r, st, ux, uy, xs, ys, th, op, idx = (t[sel] for t in (r, st, ux, uy, xs, ys, th, op, idx))
+        if ev is not None:
+            ev = {k: t[sel] for k, t in ev.items()}
         half = P // 2
         off = torch.arange(P, device=dev).float() - half
         cx_i, cy_i = xs.round(), ys.round()
@@ -423,16 +447,38 @@ class TemporalDynamicRain:
         along_n = along / (rr * a)                         # elongate along motion,
         across_n = across * a / rr                         # narrow across it (area kept)
         # teardrop: the trailing side (along < 0) tapers more the faster / longer it is
-        taper = 1 + sh['taper'] * (st.view(-1, 1, 1) - 1) * (-along_n).clamp(0, 1)
+        taper_k = sh['taper'] if ev is None else sh['taper'] * ev['neck'].view(-1, 1, 1)
+        taper = 1 + taper_k * (st.view(-1, 1, 1) - 1) * (-along_n).clamp(0, 1)
         across_n = across_n * taper
+        if ev is not None:
+            # asymmetric width: one flank narrower than the other (smooth across the axis)
+            across_n = across_n * (1 + ev['asym'].view(-1, 1, 1) * torch.tanh(4 * across_n))
 
-        tc = self.tmpl_centre[idx].view(-1, 1, 1, 2)
-        trad = self.tmpl_radius[idx].view(-1, 1, 1)
-        # template frame: rows = along, cols = across
-        grid = torch.stack([across_n * trad, along_n * trad], -1) + tc
-        patch = F.grid_sample(self.tmpl[idx], grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+        def sample(ti):
+            tc = self.tmpl_centre[ti].view(-1, 1, 1, 2)
+            trad = self.tmpl_radius[ti].view(-1, 1, 1)
+            # template frame: rows = along, cols = across
+            grid = torch.stack([across_n * trad, along_n * trad], -1) + tc
+            return F.grid_sample(self.tmpl[ti], grid, mode='bilinear', padding_mode='zeros', align_corners=True)
 
-        n_along, n_across, pm = patch[:, 0], patch[:, 1], patch[:, 2]
+        patch = sample(idx)
+        if ev is None:
+            n_along, n_across, pm = patch[:, 0], patch[:, 1], patch[:, 2]
+        else:
+            # blend the two shapes' continuous fields, THEN threshold -> crisp, gradually morphing outline
+            pb = sample(ev['idx_b'])
+            w = ev['w'].view(-1, 1, 1)
+            n_along = (1 - w) * patch[:, 0] + w * pb[:, 0]
+            n_across = (1 - w) * patch[:, 1] + w * pb[:, 1]
+            field = (1 - w) * (patch[:, 3] - 1) + w * (pb[:, 3] - 1)
+            # the sin+sin template field has diamond-like contours (kite shapes once stretched);
+            # mixing in a round field (1 at centre, 0 at the drop edge, same taper / asymmetry
+            # warp) gives a rounded front with a tapering tail
+            rho = sh.get('roundness', 0.0)
+            if rho > 0:
+                round_f = (1 - torch.sqrt(across_n ** 2 + along_n ** 2)).clamp(-1, 1)
+                field = (1 - rho) * field + rho * round_f
+            pm = (field / sh['edge_band'] + 0.5).clamp(0, 1)
         # rotate normals back to image (row, col)
         n_col = n_across * (-uy.view(-1, 1, 1)) + n_along * ux.view(-1, 1, 1)
         n_row = n_across * ux.view(-1, 1, 1) + n_along * uy.view(-1, 1, 1)
@@ -467,11 +513,23 @@ class TemporalDynamicRain:
         idx = torch.tensor([d.template for d in drops], device=dev)
         args = (r, st, ux, uy, xs, ys, th, op, idx)
         N = len(drops)
+        ev = None
+        grow = 1.0     # patch-extent factor; asymmetry can widen one flank by 1 / (1 - asym_max)
+        if sh.get('evolve', False):
+            grow = 1.0 / (1.0 - sh['asym_max'])
+            ev = {
+                'idx_b': torch.tensor([d.template_b for d in drops], device=dev),
+                'w': torch.tensor([0.5 - 0.5 * math.cos(d.shape_phase) for d in drops], **f32),
+                'asym': torch.tensor([d.asym for d in drops], **f32),
+                # big sliding drops develop a stronger trailing neck
+                'neck': torch.tensor([1 + sh['neck_gain'] * min(max(d.radius / d.slide_radius - 1, 0), 1)
+                                      if d.state == 'sliding' else 1.0 for d in drops], **f32),
+            }
 
         if renderer == 'loop':
-            ext = (r * st.sqrt() * 1.3 + 3).max().item()
+            ext = (r * st.sqrt() * 1.3 * grow + 3).max().item()
             P = int(min(2 * math.ceil(ext) + 1, sh['max_patch']))
-            pm, pv, x0s, y0s = self._drop_patches(torch.arange(N, device=dev), P, *args)
+            pm, pv, x0s, y0s = self._drop_patches(torch.arange(N, device=dev), P, *args, ev=ev)
             t0 = self._tick('drops_patches', t0)
             x0s, y0s = x0s.tolist(), y0s.tolist()
             for k in range(N):
@@ -489,7 +547,7 @@ class TemporalDynamicRain:
             return v_map, m_map
 
         # ---- batched: bucket drops by the patch size they need ----
-        ext = r * st.sqrt() * 1.3 + 3
+        ext = r * st.sqrt() * 1.3 * grow + 3
         need = (2 * torch.ceil(ext) + 1).clamp(max=sh['max_patch'])
         buckets = [b for b in sh.get('patch_buckets', [25, 41, 65, 97, 129]) if b < sh['max_patch']] + [sh['max_patch']]
         flats, keys, ms, vs = [], [], [], []
@@ -499,7 +557,7 @@ class TemporalDynamicRain:
             lower = P
             if sel.numel() == 0:
                 continue
-            pm, pv, x0s, y0s = self._drop_patches(sel, P, *args)
+            pm, pv, x0s, y0s = self._drop_patches(sel, P, *args, ev=ev)
             ar = torch.arange(P, device=dev)
             gy = y0s.view(-1, 1, 1) + ar.view(1, P, 1)
             gx = x0s.view(-1, 1, 1) + ar.view(1, 1, P)

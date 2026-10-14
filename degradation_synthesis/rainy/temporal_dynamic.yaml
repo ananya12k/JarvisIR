@@ -6,8 +6,8 @@
 #
 # Units: pixels and frames at the native 848x480 GT resolution, `fps` frames / second.
 # All values are placeholder starting points, NOT calibrated physical constants.
-# `base` == presets/dynamic_v1.yaml (frozen reference) with every newer feature off,
-# so scenario `steady` with no overrides reproduces dynamic_v1 exactly.
+# presets/dynamic_v1.yaml is the frozen pre-scenario reference (load it with
+# --dynamic_config to reproduce dynamic_v1 exactly; newer features default off there).
 
 base:
   fps: 30
@@ -53,6 +53,16 @@ base:
     max_patch: 161
     renderer: batched         # batched (bucketed patches + one scatter) | loop (reference, identical maps)
     patch_buckets: [25, 41, 65, 97, 129]
+    # R2 gradual shape change (off in presets/dynamic_v1.yaml)
+    evolve: true
+    shape_rate: [0.01, 0.03]  # rad / frame; outline morphs to a new template every ~pi / rate frames
+    slide_shape_boost: 3.0    # sliding drops change shape faster
+    asym_noise: 0.015         # OU noise of left/right width asymmetry
+    asym_sliding_mult: 4.0
+    asym_max: 0.35
+    neck_gain: 0.5            # big sliding drops: taper x (1 + gain * clamp(r / slide_radius - 1, 0, 1))
+    roundness: 0.5            # mix of round field into the template field (rounded front, no kite shapes)
+    edge_band: 0.15           # field width of the anti-aliased edge after blending
 
   trails:
     lifetime_frames: 30
