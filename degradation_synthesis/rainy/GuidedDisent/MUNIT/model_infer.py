@@ -12,9 +12,14 @@ class MUNIT_infer(nn.Module):
         self.eval()
 
     # Assuming inputs_a is an image in 1x3xHxW format
-    def forward(self, inputs_a):
+    # style: optional Bxstyle_dimx1x1 (or 1xstyle_dimx1x1) code; pass the same one
+    # for every frame of a clip to keep the wet appearance fixed over time
+    def forward(self, inputs_a, style=None):
 
-        s_b = torch.randn(inputs_a.size(0), self.style_dim, 1, 1).cuda()
+        if style is None:
+            s_b = torch.randn(inputs_a.size(0), self.style_dim, 1, 1).cuda()
+        else:
+            s_b = style.expand(inputs_a.size(0), -1, -1, -1)
         c_a,    _ = self.gen_a.encode(inputs_a)
         x_ab = self.gen_b.decode(c_a, s_b)
         return x_ab

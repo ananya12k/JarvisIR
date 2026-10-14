@@ -211,18 +211,25 @@ class DropModel:
             pad_value_top = floor((self.imsize[1] - layer_size) / 2)
             pad_value_bottom = ceil((self.imsize[1] - layer_size) / 2)
 
-            drops_layer = F.pad(drops_layer, (pad_value_top, pad_value_bottom, pad_value_left, pad_value_right), value=0)
+            # Pad + translate in chunks: each drop becomes a full-size canvas, so doing
+            # all of them at once needs several GB at large resolutions. Same result as
+            # blend() over the whole layer (sum / nonzero-count accumulated per chunk).
+            chunk = 32
+            sum_layer = torch.zeros(1, 4, self.imsize[0], self.imsize[1]).to(device)
+            cnt_layer = torch.zeros(1, 4, self.imsize[0], self.imsize[1]).to(device)
+            for c in range(0, drops_layer.size(0), chunk):
+                part = F.pad(drops_layer[c:c + chunk], (pad_value_top, pad_value_bottom, pad_value_left, pad_value_right), value=0)
 
-            # random displacement TODO: this one can be parallelized if we concat the images
-            drops_layer = kornia.geometry.transform.translate(drops_layer, offsets_layer)
-
-            # return to -1, 1 encoding
-            drops = drops_layer[:, :3]
-            masks = drops_layer[:, 3]
+                # random displacement
+                part = kornia.geometry.transform.translate(part, offsets_layer[c:c + chunk])
+                sum_layer += part.sum(dim = 0, keepdim = True)
+                cnt_layer += (part != 0).float().sum(dim = 0, keepdim = True)
+            cnt_layer[cnt_layer == 0] = 1
+            drops_layer = sum_layer / cnt_layer
 
             # Getting a single displacement map
-            drops = self.blend(drops).unsqueeze(0)
-            masks = self.blend(masks).unsqueeze(0).unsqueeze(0)
+            drops = drops_layer[:, :3]
+            masks = drops_layer[:, 3:4]
 
             dropmap[dropmap == 0] = drops[dropmap == 0]
             maskmap[maskmap == 0] = masks[maskmap == 0]
@@ -235,9 +242,25 @@ class DropModel:
 
         return noise.view(self.r.size(0), 3, -1).permute(0, 2, 1)
 
-    def add_drops(self, im, sigma = torch.zeros(1).fill_(30).to(device), transparency = torch.zeros(1).fill_(1).to(device), with_bias = False,  return_drops = False):
+    def add_drops(self, im, sigma = torch.zeros(1).fill_(30).to(device), transparency = torch.zeros(1).fill_(1).to(device), with_bias = False,  return_drops = False, normal_map = None):
 
-        v, mask = self.get_normal_map()
+        # normal_map: optional precomputed (v, mask) from get_normal_map(), so the
+        # same droplets can be reused (or shifted) across video frames
+        v, mask = normal_map if normal_map is not None else self.get_normal_map()
+        return self.apply_drops(im, v, mask, sigma = sigma, transparency = transparency,
+                                with_bias = with_bias, return_drops = return_drops)
+
+    def apply_drops(self, im, v, mask, sigma = torch.zeros(1).fill_(30).to(device), transparency = torch.zeros(1).fill_(1).to(device), with_bias = False, return_drops = False):
+        """Optical part of add_drops: refract + blur `im` through a given droplet map.
+
+        im:   1x3xHxW image in [-1, 1]
+        v:    1x(H*W)x3 (or 1xHxWx3) -- channels 0,1 are the (row, col) normal components,
+              channel 2 the thickness; refraction offset = -v[:2] * v[2], in normalised
+              [-1, 1] image coordinates (NOT pixels)
+        mask: 1x(H*W)x1 (or 1xHxWx1) droplet coverage / alpha in [0, 1] (blurred here)
+        """
+        v = v.reshape(1, self.imsize[0] * self.imsize[1], 3)
+        mask = mask.reshape(1, self.imsize[0] * self.imsize[1], 1)
         # Refraction
         im_coords = (self.uv * 2 - 1)
         refraction_coords = - v[:, :, :2] * v[:, :, 2].unsqueeze(-1)

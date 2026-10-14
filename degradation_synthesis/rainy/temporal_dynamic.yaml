@@ -1,0 +1,67 @@
+# temporal_dynamic windshield-water simulator (see temporal_dynamic.py)
+# Units: pixels and frames at the native 848x480 GT resolution, `fps` frames / second.
+# These are placeholder starting values, NOT calibrated physical constants.
+temporal_dynamic:
+  fps: 30
+  profile: false             # per-stage render timing (adds GPU syncs)
+  warmup_frames: 300          # simulated before the first output frame (clip doesn't start dry)
+
+  spawn:
+    rate_per_second: 90       # new drops / s at rain_intensity 1.0 (Poisson); 120 -> 90 (ablation B5)
+    fade_in_frames: 4
+    radius_median: 5.25       # px, lognormal; x1.5 (ablation A1) -- used only if size_mixture is absent
+    radius_sigma: 0.45
+    size_mixture:             # uneven sizes: mostly small beads + a share of big drops
+      - {weight: 0.80, median: 4.5, sigma: 0.50}
+      - {weight: 0.20, median: 11.0, sigma: 0.35}
+    radius_min: 2.0
+    radius_max: 22.0
+
+  growth:
+    rate: 0.02                # pinned drops: dV = rate * intensity * r^2 per frame
+    evaporation: 0.002        # fraction of volume lost per frame
+
+  motion:
+    slide_radius: 13.5        # px; per-drop critical radius x U[slide_jitter]; x1.5 (ablation A1)
+    slide_jitter: [0.6, 1.7]  # wide: some small drops slide early, some grow big first (was [0.8, 1.2])
+    activation_prob: 0.15     # per frame, once above the critical radius
+    max_speed: 4.0            # px / frame for the largest drops
+    inertia: 0.15             # velocity relaxation per frame
+    pause_prob: 0.03          # stick-slip: chance per frame to get stuck
+    pause_frames: [3, 12]
+    lateral_wobble: 0.15      # px / frame, OU noise std
+    wind_drift: 0.0           # px / frame sideways
+    stop_radius_frac: 0.6     # sliding drop pins again below this x critical radius
+
+  shape:
+    num_templates: 64
+    template_res: 64
+    thickness_range: [0.3, 0.8]   # DropModel min/max thickness
+    stretch_gain: 0.5         # stretch = 1 + gain * speed
+    max_stretch: 3.0
+    stretch_smooth: 0.25
+    direction_smooth: 0.2
+    taper: 0.6                # teardrop narrowing of the trailing side
+    max_patch: 161
+    renderer: batched         # batched (bucketed patches + one scatter) | loop (reference, ~25x slower, identical maps)
+    patch_buckets: [25, 41, 65, 97, 129]
+
+  trails:
+    lifetime_frames: 30
+    width_frac: 0.35          # trail width = frac * bead radius
+    strength: 1.0
+    volume_loss: 0.12         # dV = loss * r * distance moved
+    bead_prob: 0.04           # per frame, small bead pinches off at the tail
+    blur_sigma: 1.2
+    normal_gain: 4.0
+    thickness: 0.12           # much weaker refraction than a bead
+    alpha: 0.55
+
+  merge:
+    overlap_frac: 0.70        # merge when centre distance < frac * (r1 + r2); lower = stricter. 0.85 -> 0.70 (ablation B5)
+    impact_growth: true       # a new drop landing inside a bead feeds it (no merge event / position jump)
+    bead_clearance: true      # shed beads are placed clear of the parent so they don't re-merge at once
+
+  remove:
+    min_radius: 1.0
+    wiper_period: null        # frames between wiper passes, null = no wiper
