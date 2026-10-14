@@ -19,7 +19,9 @@ Physics is a first-pass rule-based model, not a fluid solver; all parameters
 live in temporal_dynamic.yaml and are tunable, not calibrated constants.
 """
 
+import copy
 import math
+import os
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -29,6 +31,31 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
+import yaml
+
+DEFAULT_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'temporal_dynamic.yaml')
+SCENARIOS = ('light', 'steady', 'heavy', 'torrential')
+
+
+def _deep_merge(base, over):
+    """Recursively overlay `over` onto `base` (dicts merge, everything else replaces)."""
+    out = copy.deepcopy(base)
+    for k, v in over.items():
+        out[k] = _deep_merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else copy.deepcopy(v)
+    return out
+
+
+def load_rain_config(path=DEFAULT_CONFIG, scenario='steady'):
+    """Resolved simulator config for one scenario: `base` deep-merged with
+    `scenarios[scenario]`. A legacy single-config file (top-level
+    `temporal_dynamic:` key, e.g. presets/dynamic_v1.yaml) is returned as is."""
+    with open(path) as f:
+        raw = yaml.safe_load(f)
+    if 'temporal_dynamic' in raw:
+        return raw['temporal_dynamic']
+    if scenario not in raw['scenarios']:
+        raise ValueError(f'unknown scenario {scenario!r}; available: {list(raw["scenarios"])}')
+    return _deep_merge(raw['base'], raw['scenarios'][scenario] or {})
 
 
 @dataclass
@@ -108,8 +135,13 @@ def make_shape_templates(num, res, shape_threshold, generator, device):
 
 
 class TemporalDynamicRain:
-    def __init__(self, width, height, cfg, rain_intensity=1.0, shape_threshold=0.6,
-                 seed=None, device='cuda'):
+    def __init__(self, width, height, cfg=None, rain_intensity=1.0, shape_threshold=0.6,
+                 seed=None, device='cuda', scenario=None, config_path=None):
+        """cfg: resolved config dict; or leave it None and pass `scenario`
+        (light / steady / heavy / torrential) to load it from `config_path`."""
+        if cfg is None:
+            cfg = load_rain_config(config_path or DEFAULT_CONFIG, scenario or 'steady')
+        self.scenario = scenario
         self.width = width
         self.height = height
         self.cfg = cfg

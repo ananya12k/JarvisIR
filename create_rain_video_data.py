@@ -172,18 +172,34 @@ class FlickerMeter:
         return self.total / max(self.n, 1)
 
 
+def summarize_dynamic(log):
+    """Per-clip summary of a temporal_dynamic per-frame stats log: mean of every
+    numeric field, max of every `max_*` field, totals of event counts."""
+    keys = [k for k in log[0] if k != 'frame']
+    out = {}
+    for k in keys:
+        vals = np.array([r[k] for r in log], float)
+        out[f'{k}_max' if k.startswith('max_') else f'{k}_mean'] = float(vals.max() if k.startswith('max_') else vals.mean())
+    for k in ('arrivals', 'merges', 'impacts'):
+        if k in keys:
+            out[f'{k}_total'] = int(sum(r[k] for r in log))
+    return out
+
+
 def worker(rank, jobs, args):
     from rainy.GuidedDisent.droprenderer import DropModel
-    from rainy.temporal_dynamic import TemporalDynamicRain
+    from rainy.temporal_dynamic import TemporalDynamicRain, load_rain_config
 
     device = torch.device(f'cuda:{rank}')
     torch.cuda.set_device(device)
     munit = load_munit(device)
     style_dim = munit.style_dim
     one = torch.ones(1, device=device)  # droprenderer's default lives on cuda:0
-    with open(args.dynamic_config) as f:
-        dyn_cfg = yaml.safe_load(f)['temporal_dynamic']
-    modes = args.modes
+    dyn_cfgs = {}
+    if 'temporal_dynamic' in args.modes:
+        dyn_cfgs = {f'temporal_dynamic_{sc}': load_rain_config(args.dynamic_config, sc) for sc in args.scenarios}
+    dyn_modes = list(dyn_cfgs)
+    modes = [m for m in args.modes if m != 'temporal_dynamic'] + dyn_modes
     cond_names = [f'cond{i}' for i in range(args.num_conditions)]
     out_modes = modes + (['wet'] if args.save_wet else [])
 
@@ -222,16 +238,20 @@ def worker(rank, jobs, args):
                     'slide_map': dm_slide.get_normal_map(),
                 }
             del dm_slide
-            if 'temporal_dynamic' in modes:
+            # one simulator per scenario; all scenarios share the clip's seed, style and
+            # drop shape, so they differ only by their preset (controlled comparison)
+            clips[name]['sims'], clips[name]['sim_logs'] = {}, {}
+            for m, dcfg in dyn_cfgs.items():
                 sim_seed = _seed(args.sim_seed if args.sim_seed is not None else args.seed,
                                  f'{split}/{seq_id}/{name}/dynamic')
-                sim = TemporalDynamicRain(w4, h4, dyn_cfg, rain_intensity=p['rain_intensity'],
-                                          shape_threshold=p['drop_shape'], seed=sim_seed, device=device)
-                sim.warmup(dyn_cfg['warmup_frames'])
+                sim = TemporalDynamicRain(w4, h4, dcfg, rain_intensity=p['rain_intensity'],
+                                          shape_threshold=p['drop_shape'], seed=sim_seed, device=device,
+                                          scenario=m[len('temporal_dynamic_'):])
+                sim.warmup(dcfg['warmup_frames'])
                 if sim.profile is not None:
                     sim.profile.clear()
-                clips[name]['sim'] = sim
-                clips[name]['sim_log'] = []
+                clips[name]['sims'][m] = sim
+                clips[name]['sim_logs'][m] = []
             torch.cuda.empty_cache()
 
         for m in out_modes:
@@ -259,7 +279,8 @@ def worker(rank, jobs, args):
             os.makedirs(vid_dir, exist_ok=True)
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             pw, ph = w4 // 2, h4 // 2
-            panels = ['GT'] + modes + (['dynamic water map'] if 'temporal_dynamic' in modes else [])
+            # water map of the heaviest selected scenario as the last panel
+            panels = ['GT'] + modes + ([f'water map ({dyn_modes[-1][len("temporal_dynamic_"):]})'] if dyn_modes else [])
             cols = 3 if len(panels) > 4 else 2
             rows = (len(panels) + cols - 1) // cols
             writers['grid'] = cv2.VideoWriter(os.path.join(vid_dir, 'side_by_side.mp4'), fourcc, args.fps,
@@ -325,16 +346,18 @@ def worker(rank, jobs, args):
                             o, mk = timed('temporal_moving', run)
                             outs['temporal_moving'].append(o)
                             coverage[f'{name}/temporal_moving'].append((mk > 0.05).float().mean().item())
-                        if 'temporal_dynamic' in modes:
+                        for m in dyn_modes:
+                            sim = c['sims'][m]
                             def run():
-                                c['sim'].step()
-                                v, mk = c['sim'].render_maps()
+                                sim.step()
+                                v, mk = sim.render_maps()
                                 return c['dm'].apply_drops(wet_clip[j:j + 1], v, mk, **kw), mk
-                            o, mk = timed('temporal_dynamic', run)
-                            outs['temporal_dynamic'].append(o)
-                            dyn_masks.append(mk)
-                            coverage[f'{name}/temporal_dynamic'].append(c['sim'].stats['coverage'])
-                            c['sim_log'].append({'frame': os.path.basename(p), **c['sim'].stats})
+                            o, mk = timed(m, run)
+                            outs[m].append(o)
+                            if m == dyn_modes[-1]:
+                                dyn_masks.append(mk)
+                            coverage[f'{name}/{m}'].append(sim.stats['coverage'])
+                            c['sim_logs'][m].append({'frame': os.path.basename(p), **sim.stats})
                     outs = {m: torch.cat(v, 0) for m, v in outs.items()}
 
                     meters[f'{name}/wet_indep'].update(wet_indep)
@@ -382,29 +405,13 @@ def worker(rank, jobs, args):
                 'coverage_mean': {m: float(np.mean(coverage[f'{name}/{m}'])) for m in modes},
                 'coverage_first_last': {m: [coverage[f'{name}/{m}'][0], coverage[f'{name}/{m}'][-1]] for m in modes},
             }
-            if 'sim_log' in clips[name]:
-                log = clips[name]['sim_log']
-                stats[name]['dynamic'] = {
-                    'mean_active': float(np.mean([r['active'] for r in log])),
-                    'mean_sliding': float(np.mean([r['sliding'] for r in log])),
-                    'total_arrivals': int(sum(r['arrivals'] for r in log)),
-                    'total_merges': int(sum(r['merges'] for r in log)),
-                    'max_track_jump_px': float(max(r['max_track_jump'] for r in log)),
-                    'max_motion_jump_px': float(max(r['max_motion_jump'] for r in log)),
-                    'max_merge_shift_px': float(max(r['max_merge_shift'] for r in log)),
-                    'merges_per_frame': float(np.mean([r['merges'] for r in log])),
-                    'impacts_per_frame': float(np.mean([r['impacts'] for r in log])),
-                    'median_area_px': float(np.median([r['median_area'] for r in log])),
-                    'p90_radius_px': float(np.median([r['p90_radius'] for r in log])),
-                    'p10_radius_px': float(np.median([r['p10_radius'] for r in log])),
-                    'sliding_radius_p10_p90_px': [float(np.median([r['slide_r_p10'] for r in log])),
-                                                  float(np.median([r['slide_r_p90'] for r in log]))],
-                    'mean_slide_disp_px': float(np.mean([r['mean_slide_disp'] for r in log])),
-                }
-                prof = clips[name]['sim'].profile
+            stats[name]['dynamic'] = {}
+            for m, log in clips[name]['sim_logs'].items():
+                stats[name]['dynamic'][m] = summarize_dynamic(log)
+                prof = clips[name]['sims'][m].profile
                 if prof:
-                    stats[name]['dynamic']['render_ms_per_frame'] = {k: 1000 * v / n_frames for k, v in prof.items()}
-                with open(os.path.join(args.out_base, split, 'stats', f'{seq_id}_{name}_dynamic.csv'), 'w') as f:
+                    stats[name]['dynamic'][m]['render_ms_per_frame'] = {k: 1000 * v / n_frames for k, v in prof.items()}
+                with open(os.path.join(args.out_base, split, 'stats', f'{seq_id}_{name}_{m}.csv'), 'w') as f:
                     keys = list(log[0].keys())
                     f.write(','.join(keys) + '\n')
                     for r in log:
@@ -432,6 +439,8 @@ def main():
                         help='Frames in the per-sequence comparison mp4 (0 disables)')
     parser.add_argument('--modes', nargs='+', default=MODES, choices=MODES)
     parser.add_argument('--dynamic_config', type=str, default=DYNAMIC_CONFIG)
+    parser.add_argument('--scenarios', nargs='+', default=['light', 'steady', 'heavy', 'torrential'],
+                        help='temporal_dynamic rain scenarios (presets in --dynamic_config); one output mode each')
     parser.add_argument('--sim_seed', type=int, default=None,
                         help='Reseed only the temporal_dynamic simulator (everything else keeps --seed)')
     parser.add_argument('--fps', type=int, default=30, help='Output video frame rate')
@@ -450,7 +459,18 @@ def main():
     print(f'\nTotal sequences : {len(all_jobs)}  |  GPUs: {args.num_gpus}')
     print(f'Source GT       : {GT_BASE}/{{split}}/GT/{{seq_id}}/')
     print(f'Output root     : {args.out_base}/{{split}}/{{mode}}/{{cond}}/{{seq_id}}/')
-    print(f'Modes           : {args.modes}' + (' + wet' if args.save_wet else ''))
+    print(f'Modes           : {args.modes}' + (' + wet' if args.save_wet else '')
+          + (f'  |  scenarios: {args.scenarios}' if 'temporal_dynamic' in args.modes else ''))
+
+    # reproducibility: the exact resolved simulator config of every scenario + all CLI args
+    from rainy.temporal_dynamic import load_rain_config
+    os.makedirs(os.path.join(args.out_base, 'configs'), exist_ok=True)
+    with open(os.path.join(args.out_base, 'configs', 'run_args.json'), 'w') as f:
+        json.dump(vars(args), f, indent=2)
+    if 'temporal_dynamic' in args.modes:
+        for sc in args.scenarios:
+            with open(os.path.join(args.out_base, 'configs', f'temporal_dynamic_{sc}.yaml'), 'w') as f:
+                yaml.safe_dump(load_rain_config(args.dynamic_config, sc), f, sort_keys=False)
     print(f'Conditions      : {args.num_conditions} per clip  |  max frames/seq: {args.max_frames_per_seq}\n')
 
     worker_jobs = [[] for _ in range(args.num_gpus)]

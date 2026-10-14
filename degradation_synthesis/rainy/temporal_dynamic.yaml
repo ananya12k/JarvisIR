@@ -1,15 +1,23 @@
 # temporal_dynamic windshield-water simulator (see temporal_dynamic.py)
+#
+# One simulator, four rain scenarios. `base` holds every parameter; each entry
+# under `scenarios` overrides only what it changes (deep-merged onto base).
+#   load_rain_config(path, scenario)  ->  resolved flat config
+#
 # Units: pixels and frames at the native 848x480 GT resolution, `fps` frames / second.
-# These are placeholder starting values, NOT calibrated physical constants.
-temporal_dynamic:
+# All values are placeholder starting points, NOT calibrated physical constants.
+# `base` == presets/dynamic_v1.yaml (frozen reference) with every newer feature off,
+# so scenario `steady` with no overrides reproduces dynamic_v1 exactly.
+
+base:
   fps: 30
-  profile: false             # per-stage render timing (adds GPU syncs)
+  profile: false              # per-stage render timing (adds GPU syncs)
   warmup_frames: 300          # simulated before the first output frame (clip doesn't start dry)
 
   spawn:
     rate_per_second: 90       # new drops / s at rain_intensity 1.0 (Poisson); 120 -> 90 (ablation B5)
     fade_in_frames: 4
-    radius_median: 5.25       # px, lognormal; x1.5 (ablation A1) -- used only if size_mixture is absent
+    radius_median: 5.25       # used only if size_mixture is absent
     radius_sigma: 0.45
     size_mixture:             # uneven sizes: mostly small beads + a share of big drops
       - {weight: 0.80, median: 4.5, sigma: 0.50}
@@ -22,8 +30,8 @@ temporal_dynamic:
     evaporation: 0.002        # fraction of volume lost per frame
 
   motion:
-    slide_radius: 13.5        # px; per-drop critical radius x U[slide_jitter]; x1.5 (ablation A1)
-    slide_jitter: [0.6, 1.7]  # wide: some small drops slide early, some grow big first (was [0.8, 1.2])
+    slide_radius: 13.5        # px; per-drop critical radius x U[slide_jitter] (ablation A1)
+    slide_jitter: [0.6, 1.7]  # some small drops slide early, some grow big first
     activation_prob: 0.15     # per frame, once above the critical radius
     max_speed: 4.0            # px / frame for the largest drops
     inertia: 0.15             # velocity relaxation per frame
@@ -43,7 +51,7 @@ temporal_dynamic:
     direction_smooth: 0.2
     taper: 0.6                # teardrop narrowing of the trailing side
     max_patch: 161
-    renderer: batched         # batched (bucketed patches + one scatter) | loop (reference, ~25x slower, identical maps)
+    renderer: batched         # batched (bucketed patches + one scatter) | loop (reference, identical maps)
     patch_buckets: [25, 41, 65, 97, 129]
 
   trails:
@@ -58,10 +66,45 @@ temporal_dynamic:
     alpha: 0.55
 
   merge:
-    overlap_frac: 0.70        # merge when centre distance < frac * (r1 + r2); lower = stricter. 0.85 -> 0.70 (ablation B5)
+    overlap_frac: 0.70        # merge when centre distance < frac * (r1 + r2); lower = stricter (ablation B5)
     impact_growth: true       # a new drop landing inside a bead feeds it (no merge event / position jump)
     bead_clearance: true      # shed beads are placed clear of the parent so they don't re-merge at once
 
   remove:
     min_radius: 1.0
     wiper_period: null        # frames between wiper passes, null = no wiper
+
+scenarios:
+  light:                      # mostly stationary small beads, occasional big ones, few sliders
+    spawn:
+      rate_per_second: 30
+      size_mixture:
+        - {weight: 0.90, median: 4.0, sigma: 0.45}
+        - {weight: 0.10, median: 10.0, sigma: 0.30}
+    growth: {rate: 0.012}
+    motion: {slide_radius: 16.0, max_speed: 3.0, activation_prob: 0.10}
+    trails: {lifetime_frames: 20, width_frac: 0.30}
+
+  steady: {}                  # == base (dynamic_v1): uneven sizes, regular sliding, trails, merging
+
+  heavy:                      # bigger + faster drops, frequent impacts, growth and merging
+    spawn:
+      rate_per_second: 160
+      size_mixture:
+        - {weight: 0.70, median: 5.0, sigma: 0.50}
+        - {weight: 0.30, median: 13.0, sigma: 0.35}
+      radius_max: 26.0
+    growth: {rate: 0.03}
+    motion: {slide_radius: 12.0, max_speed: 6.0, activation_prob: 0.25}
+    trails: {lifetime_frames: 45, width_frac: 0.45}
+
+  torrential:                 # dense accumulation; connected flow (later stages add rivulets + film)
+    spawn:
+      rate_per_second: 300
+      size_mixture:
+        - {weight: 0.65, median: 5.0, sigma: 0.50}
+        - {weight: 0.35, median: 14.0, sigma: 0.35}
+      radius_max: 28.0
+    growth: {rate: 0.04}
+    motion: {slide_radius: 11.0, max_speed: 7.0, activation_prob: 0.35}
+    trails: {lifetime_frames: 60, width_frac: 0.5}
