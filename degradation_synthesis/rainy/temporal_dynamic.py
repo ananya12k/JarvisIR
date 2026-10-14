@@ -122,6 +122,8 @@ class TrailSegment:
     width: float
     strength: float
     age: int = 0
+    parent: int = -1                    # id of the drop that laid it
+    water: float = 0.0                  # volume it took from the drop
 
 
 def make_shape_templates(num, res, shape_threshold, generator, device):
@@ -185,6 +187,11 @@ class TemporalDynamicRain:
         self._prev_rpos = {}
         self._merged_ids = set()
         self.ghosts: List[Droplet] = []
+        self._new_segments: List[TrailSegment] = []
+        wc = cfg['trails'].get('wetness', {})
+        self.gs = wc.get('grid_scale', 4)
+        self.wet = np.zeros((math.ceil(height / self.gs), math.ceil(width / self.gs)), np.float32)
+        self._wet_gx = np.zeros_like(self.wet)
         self.profile = defaultdict(float) if cfg.get('profile', False) else None
 
         gen = torch.Generator(device=self.device)
@@ -262,12 +269,18 @@ class TemporalDynamicRain:
         towards a size-dependent speed with inertia, stick-slip pauses, lateral
         wobble, lose volume into a trail and shed small beads."""
         m, tr = self.cfg['motion'], self.cfg['trails']
+        wc = tr.get('wetness', {})
+        wet_on = wc.get('enabled', False)
         new_beads = []
         disp = []
+        self._new_segments = []
         for d in self.droplets:
             r = d.radius
+            wet_here = self._wet_at(d.x, d.y) if wet_on else 0.0
             if d.state == 'pinned':
-                if r > d.slide_radius and self.rng.random() < m['activation_prob']:
+                # a pre-wetted track lowers the size needed to start sliding
+                thr = d.slide_radius * (1 - wc.get('threshold_relief', 0.0) * min(wet_here, 1.0)) if wet_on else d.slide_radius
+                if r > thr and self.rng.random() < m['activation_prob']:
                     d.state = 'sliding'
                 else:
                     continue
@@ -281,9 +294,14 @@ class TemporalDynamicRain:
                     d.pause = int(self.rng.integers(*m['pause_frames']))
                 frac = np.clip((r - 0.8 * d.slide_radius) / d.slide_radius, 0.15, 1.0)
                 target_vy = m['max_speed'] * frac
+                steer = 0.0
+                if wet_on:
+                    # wet tracks are faster, and drops are drawn sideways into them
+                    target_vy *= 1 + wc['speed_boost'] * min(wet_here, 1.0)
+                    steer = wc['steer_gain'] * self._wet_grad_x(d.x, d.y + wc['lookahead'] * r)
                 d.vy += (target_vy - d.vy) * m['inertia']
                 d.wobble += -0.2 * d.wobble + self.rng.normal(0, m['lateral_wobble'])
-                d.vx += (d.wobble + m['wind_drift'] - d.vx) * m['inertia']
+                d.vx += (d.wobble + m['wind_drift'] + steer - d.vx) * m['inertia']
 
             x0, y0 = d.x, d.y
             d.x += d.vx
@@ -296,7 +314,9 @@ class TemporalDynamicRain:
                 loss = min(tr['volume_loss'] * r * step, 0.5 * d.volume)
                 d.volume -= loss
                 w = tr['width_frac'] * r * d.trail_width_jitter * float(self.rng.uniform(0.75, 1.25))
-                self.trails.append(TrailSegment(x0, y0, d.x, d.y, w, tr['strength']))
+                seg = TrailSegment(x0, y0, d.x, d.y, w, tr['strength'], parent=d.id, water=loss)
+                self.trails.append(seg)
+                self._new_segments.append(seg)
                 # occasionally a small bead pinches off at the tail
                 if self.rng.random() < tr['bead_prob'] and d.volume > 8:
                     bv = d.volume * float(self.rng.uniform(0.03, 0.08))
@@ -401,6 +421,7 @@ class TemporalDynamicRain:
         wp = rm.get('wiper_period')
         if wp and self.frame_index > 0 and self.frame_index % wp == 0:
             self.droplets, self.trails, self.ghosts = [], [], []
+            self.wet[:] = 0
         self.stats['removed'] = before - len(self.droplets)
         for s in self.trails:
             s.age += 1
@@ -416,6 +437,7 @@ class TemporalDynamicRain:
         self.update_shapes()
         self.handle_merging()
         self.remove_expired()
+        self.update_wetness()
         for d in self.droplets:
             d.age += 1
         self._update_easing()
@@ -452,6 +474,43 @@ class TemporalDynamicRain:
         self.stats['active'] = len(self.droplets)
         self.stats['trail_segments'] = len(self.trails)
         self.frame_index += 1
+
+    def _cell(self, x, y):
+        gh, gw = self.wet.shape
+        return min(max(int(y / self.gs), 0), gh - 1), min(max(int(x / self.gs), 0), gw - 1)
+
+    def _wet_at(self, x, y):
+        return float(self.wet[self._cell(x, y)])
+
+    def _wet_grad_x(self, x, y):
+        """d(wetness)/dx in wetness-units per cell, from the smoothed field."""
+        return float(self._wet_gx[self._cell(x, y)])
+
+    def update_wetness(self):
+        """Persistent wet-path memory on a coarse grid: this frame's trail water is
+        deposited along the segments, everything drains slowly. Also measures how
+        many new segments run along existing wet paths (trail reuse)."""
+        wc = self.cfg['trails'].get('wetness', {})
+        if not wc.get('enabled', False):
+            return
+        segs = self._new_segments
+        # trail reuse: is the glass just AHEAD of a sliding drop (where its own trail
+        # hasn't reached yet) already wet from earlier water?
+        ahead = [self._wet_at(d.x + 2 * d.dir_x * d.radius, d.y + 2 * d.dir_y * d.radius) > wc['reuse_threshold']
+                 for d in self.droplets if d.state == 'sliding']
+        self.stats['trail_reuse'] = float(np.mean(ahead)) if ahead else 0.0
+        self.wet *= (1.0 - wc['drain'])
+        if segs:
+            dep = np.zeros_like(self.wet)
+            g = self.gs
+            for sg in segs:
+                cv2.line(dep, (int(sg.x0 / g), int(sg.y0 / g)), (int(sg.x1 / g), int(sg.y1 / g)),
+                         float(min(1.0, sg.water * wc['deposit_gain'])),
+                         thickness=max(1, int(round(sg.width / g))))
+            self.wet = np.minimum(self.wet + dep, wc['max'])
+        sm = cv2.GaussianBlur(self.wet, (0, 0), 1.0)
+        self._wet_gx = np.gradient(sm, axis=1).astype(np.float32)
+        self.stats['wet_coverage'] = float((self.wet > wc['reuse_threshold']).mean())
 
     def _update_easing(self):
         """Advance merge easing: drawn offsets / hidden volume of survivors shrink to

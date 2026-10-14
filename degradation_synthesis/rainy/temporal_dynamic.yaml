@@ -74,6 +74,17 @@ base:
     normal_gain: 4.0
     thickness: 0.12           # much weaker refraction than a bead
     alpha: 0.55
+    wetness:                  # R4: persistent wet-path memory that steers later water
+      enabled: true
+      grid_scale: 4           # px per cell
+      deposit_gain: 0.08      # wetness added per unit of trail water (capped at 1 per segment)
+      drain: 0.015            # fraction lost per frame (~70-frame memory)
+      max: 1.5
+      steer_gain: 6.0         # sideways pull (px / frame) per unit wetness gradient per cell
+      lookahead: 1.5          # x radius below the drop where the gradient is sampled
+      speed_boost: 0.5        # target speed x (1 + boost * wetness)
+      threshold_relief: 0.3   # slide threshold x (1 - relief * wetness)
+      reuse_threshold: 0.2    # wetness counted as "existing wet path"
 
   merge:
     overlap_frac: 0.70        # merge when centre distance < frac * (r1 + r2); lower = stricter (ablation B5)
