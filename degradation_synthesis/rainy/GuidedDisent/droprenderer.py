@@ -124,33 +124,41 @@ class DropModel:
         self.bias = self.maskblur(bias)
 
 
-    def get_drop_stock(self, numdrops):
+    def get_drop_stock(self, numdrops, chunk = 64):
 
-        single_drop = self.single_drop.repeat(numdrops, 1, 1)
-        single_drop = single_drop.view(numdrops, -1, 2)
+        # Same random draws as before (all noise at once, one thickness), but the
+        # per-drop 256x256 maths runs in chunks: with many large drops the full-batch
+        # intermediates need > 8 GB. Output is identical.
+        noise_all = torch.rand(numdrops, 3, int(self.drop_size / self.noise_resize), int(self.drop_size / self.noise_resize)).to(device)
+        thickness = random.uniform(self.min_thickness, self.max_thickness)
+        out = []
+        for c in range(0, numdrops, chunk):
+            nd = min(chunk, numdrops - c)
+            single_drop = self.single_drop.repeat(nd, 1, 1)
+            single_drop = single_drop.view(nd, -1, 2)
 
-        noise = torch.rand(numdrops, 3, int(self.drop_size / self.noise_resize), int(self.drop_size / self.noise_resize)).to(device)
-        noise = F.interpolate(noise, size = (self.drop_size, self.drop_size), mode = 'bilinear')
-        noise = noise.view(numdrops, 3, -1).permute(0, 2, 1)
-        n = noise[:, :, 2].unsqueeze(-1)
+            noise = F.interpolate(noise_all[c:c + nd], size = (self.drop_size, self.drop_size), mode = 'bilinear')
+            noise = noise.view(nd, 3, -1).permute(0, 2, 1)
+            n = noise[:, :, 2].unsqueeze(-1)
 
-        p = math.pi * 2 * (single_drop - 0.25) + (n - 0.5) * 2
-        s = torch.sin(p)
-        t = (s[:, :, 0] + s[:, :, 1])
+            p = math.pi * 2 * (single_drop - 0.25) + (n - 0.5) * 2
+            s = torch.sin(p)
+            t = (s[:, :, 0] + s[:, :, 1])
 
-        k = torch.cos(p)
-        interp = (0.2 * (1 - t - 0.5) + 2. * (t - 0.5)).unsqueeze(-1)
-        v = - torch.cat((k, interp), -1)
+            k = torch.cos(p)
+            interp = (0.2 * (1 - t - 0.5) + 2. * (t - 0.5)).unsqueeze(-1)
+            v = - torch.cat((k, interp), -1)
 
-        # normalization
-        v /= torch.sqrt(v[:, :,  0] ** 2 + v[:, :, 1] ** 2 + v[:, :, 2] ** 2).unsqueeze(-1)
-        v = v.permute(0, 2, 1)
-        v[:, 2, :] = random.uniform(self.min_thickness, self.max_thickness)
-        v = v.view(numdrops, 3, self.drop_size, self.drop_size)
-        mask = (t > self.shape_threshold).float()
-        mask = mask.view(numdrops, 1, self.drop_size, self.drop_size)
+            # normalization
+            v /= torch.sqrt(v[:, :,  0] ** 2 + v[:, :, 1] ** 2 + v[:, :, 2] ** 2).unsqueeze(-1)
+            v = v.permute(0, 2, 1)
+            v[:, 2, :] = thickness
+            v = v.view(nd, 3, self.drop_size, self.drop_size)
+            mask = (t > self.shape_threshold).float()
+            mask = mask.view(nd, 1, self.drop_size, self.drop_size)
+            out.append(torch.cat((v * mask, mask), dim = 1))
 
-        return torch.cat((v * mask, mask), dim = 1)
+        return torch.cat(out, 0)
 
 
     def get_numdrops(self):
