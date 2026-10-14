@@ -252,24 +252,58 @@ def summarize_dynamic(log):
     return out
 
 
-def worker(rank, jobs, args):
+def worker(rank, gpu, queues, mem_frac, args):
+    """One worker per (GPU, slot). Pulls (split, seq, modes, tag) jobs from the shared
+    queues (in order: first queue until empty, then the next), so a GPU never idles
+    while work remains. A failing job is logged to failed_jobs.txt and the worker
+    moves on instead of dying."""
     from rainy.GuidedDisent.droprenderer import DropModel
     from rainy.temporal_dynamic import TemporalDynamicRain, load_rain_config
 
-    device = torch.device(f'cuda:{rank}')
+    device = torch.device(f'cuda:{gpu}')
     torch.cuda.set_device(device)
+    # fixed convolution algorithms: otherwise cuDNN may pick a different one when less
+    # GPU memory is free (shared GPUs), giving last-bit differences between schedules
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    if mem_frac < 1.0:
+        # several workers share this GPU: cap the caching allocator so one worker's
+        # cache can't starve the others
+        torch.cuda.set_per_process_memory_fraction(mem_frac, device)
     munit = load_munit(device)
     style_dim = munit.style_dim
     one = torch.ones(1, device=device)  # droprenderer's default lives on cuda:0
-    dyn_cfgs = {}
-    if 'temporal_dynamic' in args.modes:
-        dyn_cfgs = {f'temporal_dynamic_{sc}': load_rain_config(args.dynamic_config, sc) for sc in args.scenarios}
-    dyn_modes = list(dyn_cfgs)
-    modes = [m for m in args.modes if m != 'temporal_dynamic'] + dyn_modes
+    all_dyn_cfgs = {f'temporal_dynamic_{sc}': load_rain_config(args.dynamic_config, sc) for sc in args.scenarios} \
+        if 'temporal_dynamic' in args.modes else {}
     cond_names = [f'cond{i}' for i in range(args.num_conditions)]
-    out_modes = modes + (['wet'] if args.save_wet else [])
+    # MUNIT decodes in fixed-size chunks: low peak memory when GPUs are shared, and the
+    # chunk size (not the scheduling) decides the floating-point result, so outputs are
+    # byte-identical however jobs are queued
+    chunk = args.munit_chunk
 
-    for split, seq_id in jobs:
+    def decode(content, style):
+        return torch.cat([munit.gen_b.decode(content[k:k + chunk], style[k:k + chunk])
+                          for k in range(0, content.size(0), chunk)], 0)
+
+    def next_job():
+        for q in queues:
+            try:
+                return q.get(timeout=2)
+            except Exception:       # queue.Empty: move on to the next queue
+                continue
+        return None
+
+    for split, seq_id, job_modes, tag in iter(next_job, None):
+      try:
+        torch.cuda.reset_peak_memory_stats(device)
+        print(f'[worker {rank} / GPU {gpu}] start {split}/{seq_id} {tag or "all modes"}', flush=True)
+        dyn_cfgs = all_dyn_cfgs if 'temporal_dynamic' in job_modes else {}
+        dyn_modes = list(dyn_cfgs)
+        modes = [m for m in job_modes if m != 'temporal_dynamic'] + dyn_modes
+        out_modes = modes + (['wet'] if args.save_wet else [])
+        sfx = f'_{tag}' if tag else ''      # per-job file names when a clip is split by modes
+        need_indep = 'frame_indep' in modes
+        job_peak = 0.0
         gt_dir = os.path.join(GT_BASE, split, 'GT', seq_id)
         img_paths = sorted(glob.glob(os.path.join(gt_dir, '*.jpg')) +
                            glob.glob(os.path.join(gt_dir, '*.png')))
@@ -351,7 +385,7 @@ def worker(rank, jobs, args):
             panels = ['GT'] + modes + ([f'water map ({dyn_modes[-1][len("temporal_dynamic_"):]})'] if dyn_modes else [])
             cols = 3 if len(panels) > 4 else 2
             rows = (len(panels) + cols - 1) // cols
-            writers['grid'] = cv2.VideoWriter(os.path.join(vid_dir, 'side_by_side.mp4'), fourcc, args.fps,
+            writers['grid'] = cv2.VideoWriter(os.path.join(vid_dir, f'side_by_side{sfx}.mp4'), fourcc, args.fps,
                                               (pw * cols, ph * rows))
             for m in ['GT'] + modes:
                 writers[m] = cv2.VideoWriter(os.path.join(vid_dir, f'{m}.mp4'), fourcc, args.fps, (w4, h4))
@@ -361,6 +395,8 @@ def worker(rank, jobs, args):
                     writers[f'tracks/{m}'] = cv2.VideoWriter(os.path.join(vid_dir, f'tracks_{sc}.mp4'), fourcc, args.fps, (w4, h4))
                     writers[f'field/{m}'] = cv2.VideoWriter(os.path.join(vid_dir, f'field_{sc}.mp4'), fourcc, args.fps, (w4, h4))
         track_hist = {m: {} for m in dyn_modes}
+
+        nonlocal_peak = [0.0]
 
         def timed(m, fn):
             torch.cuda.synchronize(device)
@@ -372,9 +408,10 @@ def worker(rank, jobs, args):
             if cur['cond'] == cond_names[0]:
                 frame_ms[m].append(1000 * (time.perf_counter() - t0))
             mode_peak[m] = max(mode_peak[m], torch.cuda.max_memory_allocated(device) / 1e9)
+            nonlocal_peak[0] = max(nonlocal_peak[0], mode_peak[m])
             return out
 
-        pbar = tqdm(total=len(img_paths), desc=f'GPU{rank} | {split}/{seq_id}', position=rank, leave=True)
+        pbar = tqdm(total=len(img_paths), desc=f'W{rank}/GPU{gpu} | {split}/{seq_id} {tag}', position=rank, leave=True)
         for i in range(0, len(img_paths), args.batch):
             batch_paths = img_paths[i:i + args.batch]
             frames = [cv2.imread(p)[:h4, :w4, ::-1] for p in batch_paths]
@@ -392,9 +429,10 @@ def worker(rank, jobs, args):
                     for p in batch_paths:
                         _seed_all(_seed(args.seed, f'{p}/{name}/style'))
                         styles.append(torch.randn(1, style_dim, 1, 1, device=device))
-                    wet_indep = munit.gen_b.decode(content, torch.cat(styles, 0))
+                    # (only frame_indep uses per-frame styles; skip the decode otherwise)
+                    wet_indep = decode(content, torch.cat(styles, 0)) if need_indep else None
                     # Level 2: one style for the whole clip
-                    wet_clip = munit.gen_b.decode(content, c['style'].expand(b, -1, -1, -1))
+                    wet_clip = decode(content, c['style'].expand(b, -1, -1, -1))
 
                     outs = {m: [] for m in modes}
                     dyn_masks = []
@@ -442,7 +480,8 @@ def worker(rank, jobs, args):
                             c['sim_logs'][m].append({'frame': os.path.basename(p), **sim.stats})
                     outs = {m: torch.cat(v, 0) for m, v in outs.items()}
 
-                    meters[f'{name}/wet_indep'].update(wet_indep)
+                    if need_indep:
+                        meters[f'{name}/wet_indep'].update(wet_indep)
                     meters[f'{name}/wet_clip_style'].update(wet_clip)
                     for m in modes:
                         meters[f'{name}/{m}'].update(outs[m])
@@ -490,7 +529,7 @@ def worker(rank, jobs, args):
         n_frames = len(img_paths)
         if args.diagnostics:
             os.makedirs(os.path.join(args.out_base, 'plots'), exist_ok=True)
-            plot_diagnostics(os.path.join(args.out_base, 'plots', f'{split}_{seq_id}.png'),
+            plot_diagnostics(os.path.join(args.out_base, 'plots', f'{split}_{seq_id}{sfx}.png'),
                              f'{split}/{seq_id} ({cond_names[0]}): water coverage and runtime per frame',
                              {m: coverage[f'{cond_names[0]}/{m}'] for m in modes},
                              frame_ms, modes)
@@ -501,7 +540,7 @@ def worker(rank, jobs, args):
         for name in cond_names:
             stats[name] = {
                 'flicker_ratio': {k: meters[f'{name}/{k}'].value() / max(gt_flicker, 1e-8)
-                                  for k in modes + ['wet_indep', 'wet_clip_style']},
+                                  for k in modes + (['wet_indep'] if need_indep else []) + ['wet_clip_style']},
                 'coverage_mean': {m: float(np.mean(coverage[f'{name}/{m}'])) for m in modes},
                 'coverage_first_last': {m: [coverage[f'{name}/{m}'][0], coverage[f'{name}/{m}'][-1]] for m in modes},
             }
@@ -516,9 +555,19 @@ def worker(rank, jobs, args):
                     f.write(','.join(keys) + '\n')
                     for r in log:
                         f.write(','.join(str(r[k]) for k in keys) + '\n')
-        with open(os.path.join(args.out_base, split, 'stats', f'{seq_id}.json'), 'w') as f:
+        with open(os.path.join(args.out_base, split, 'stats', f'{seq_id}{sfx}.json'), 'w') as f:
             json.dump(stats, f, indent=2)
         del clips
+        torch.cuda.empty_cache()
+        print(f'[worker {rank} / GPU {gpu}] done  {split}/{seq_id} {tag or "all modes"} '
+              f'(peak {max(nonlocal_peak[0], torch.cuda.max_memory_allocated(device) / 1e9):.1f} GB)', flush=True)
+      except Exception:
+        import traceback
+        msg = traceback.format_exc()
+        print(f'[worker {rank} / GPU {gpu}] FAILED {split}/{seq_id} {tag}\n{msg}', flush=True)
+        with open(os.path.join(args.out_base, 'failed_jobs.txt'), 'a') as f:
+            f.write(f'{split}/{seq_id} {tag or "all"} (GPU {gpu})\n{msg}\n')
+        clips = None
         torch.cuda.empty_cache()
 
 
@@ -526,12 +575,22 @@ def main():
     parser = argparse.ArgumentParser(description='Rain video synthesis (frame-independent vs temporally consistent)')
     parser.add_argument('--splits', nargs='+', default=['train', 'val', 'test'])
     parser.add_argument('--num_gpus', type=int, default=4)
+    parser.add_argument('--jobs_per_gpu', type=int, default=1,
+                        help='Workers per GPU pulling from the shared queue (dynamic-only jobs are light; 2 fit on 12 GB)')
+    parser.add_argument('--munit_chunk', type=int, default=2,
+                        help='Frames per MUNIT decode call (fixed so results do not depend on scheduling)')
+    parser.add_argument('--heavy_mem_frac', type=float, default=0.62,
+                        help='GPU memory share of the heavy-job worker when jobs_per_gpu > 1 (rest split among light workers)')
+    parser.add_argument('--split_modes', action='store_true',
+                        help='Queue baselines and dynamic scenarios of a clip as separate jobs (more parallelism)')
     parser.add_argument('--out_base', type=str, default=OUT_BASE)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--num_conditions', type=int, default=NUM_CONDITIONS,
                         help=f'Independent param draws per clip (default: {NUM_CONDITIONS})')
     parser.add_argument('--max_frames_per_seq', type=int, default=MAX_FRAMES_PER_SEQ)
     parser.add_argument('--max_seqs', type=int, default=None, help='Limit sequences per split (testing)')
+    parser.add_argument('--seqs', nargs='+', default=None,
+                        help='Only these sequence ids (e.g. 02 06); lets one clip be split by --modes across GPUs')
     parser.add_argument('--first_n', type=int, default=None,
                         help='Use only the first N consecutive frames of each sequence (testing)')
     parser.add_argument('--batch', type=int, default=BATCH)
@@ -555,10 +614,26 @@ def main():
         if not os.path.isdir(gt_dir):
             print(f'[skip] {gt_dir} not found')
             continue
-        seqs = sorted(os.listdir(gt_dir))[:args.max_seqs]
-        all_jobs += [(split, s) for s in seqs]
+        seqs = sorted(os.listdir(gt_dir))
+        if args.seqs:
+            seqs = [q for q in seqs if q in args.seqs]
+        seqs = seqs[:args.max_seqs]
+        for q in seqs:
+            n = len([f for f in os.listdir(os.path.join(gt_dir, q)) if f.lower().endswith(('.jpg', '.png'))])
+            n = min(n, args.first_n or n, args.max_frames_per_seq)
+            if args.split_modes:
+                # baselines and dynamic scenarios as separate jobs (compose_rain_videos.py
+                # merges their per-mode videos afterwards)
+                groups = [('baselines', [m for m in args.modes if m != 'temporal_dynamic']),
+                          ('dynamic', [m for m in args.modes if m == 'temporal_dynamic'])]
+                all_jobs += [(split, q, ms, tag, n) for tag, ms in groups if ms]
+            else:
+                all_jobs.append((split, q, list(args.modes), '', n))
+    # longest jobs first, so short ones fill the gaps at the end
+    all_jobs.sort(key=lambda j: -j[4])
+    n_workers = args.num_gpus * args.jobs_per_gpu
 
-    print(f'\nTotal sequences : {len(all_jobs)}  |  GPUs: {args.num_gpus}')
+    print(f'\nTotal jobs      : {len(all_jobs)}  |  GPUs: {args.num_gpus} x {args.jobs_per_gpu} worker(s) each (shared queue)')
     print(f'Source GT       : {GT_BASE}/{{split}}/GT/{{seq_id}}/')
     print(f'Output root     : {args.out_base}/{{split}}/{{mode}}/{{cond}}/{{seq_id}}/')
     print(f'Modes           : {args.modes}' + (' + wet' if args.save_wet else '')
@@ -575,21 +650,33 @@ def main():
                 yaml.safe_dump(load_rain_config(args.dynamic_config, sc), f, sort_keys=False)
     print(f'Conditions      : {args.num_conditions} per clip  |  max frames/seq: {args.max_frames_per_seq}\n')
 
-    worker_jobs = [[] for _ in range(args.num_gpus)]
-    for i, job in enumerate(all_jobs):
-        worker_jobs[i % args.num_gpus].append(job)
-    for rank, jobs in enumerate(worker_jobs):
-        print(f'  GPU {rank}: {[f"{s}/{q}" for s, q in jobs]}')
+    for j in all_jobs:
+        print(f'  queued {j[0]}/{j[1]} {j[3] or "all modes"} ({j[4]} frames)')
 
+    # shared work queues: every worker takes the next job as soon as it is free.
+    # 'heavy' = jobs with baseline modes (frame_indep peaks at several GB), 'light' =
+    # dynamic-only jobs (mostly CPU). Slot 0 of each GPU drains heavy then light; extra
+    # slots take light jobs only, so a GPU never runs two heavy jobs at once.
+    heavy_q, light_q = mp.Queue(), mp.Queue()
+    for split, q, ms, tag, _ in all_jobs:
+        (light_q if ms == ['temporal_dynamic'] else heavy_q).put((split, q, ms, tag))
     procs = []
-    for rank in range(args.num_gpus):
-        if not worker_jobs[rank]:
-            continue
-        p = mp.Process(target=worker, args=(rank, worker_jobs[rank], args))
+    for rank in range(n_workers):
+        gpu, slot = rank % args.num_gpus, rank // args.num_gpus
+        if args.jobs_per_gpu == 1:
+            queues, frac = (heavy_q, light_q), 1.0
+        elif slot == 0:
+            queues, frac = (heavy_q, light_q), args.heavy_mem_frac
+        else:
+            queues, frac = (light_q,), (1.0 - args.heavy_mem_frac) / (args.jobs_per_gpu - 1)
+        p = mp.Process(target=worker, args=(rank, gpu, queues, frac, args))
         p.start()
         procs.append(p)
     for p in procs:
         p.join()
+    failed = os.path.join(args.out_base, 'failed_jobs.txt')
+    if os.path.exists(failed):
+        print(f'\nSOME JOBS FAILED -- see {failed}')
     print('\nAll done.')
 
 
