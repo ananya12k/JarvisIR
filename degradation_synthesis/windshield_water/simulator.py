@@ -351,6 +351,7 @@ class WindshieldWaterSimulator:
             max_jerk_px=max(jerks, default=0.0),
             r_p10=float(np.percentile(rads, 10)), r_p50=float(np.percentile(rads, 50)),
             r_p90=float(np.percentile(rads, 90)),
+            large_drop_fraction=float((rads >= 10.0).mean()) if self.drops else 0.0,
             trails=len(self.trails.trails), trail_points=self.trails.total_points(),
             total_volume=float(sum(d.volume for d in self.drops.values())))
         self.t += dt
@@ -435,8 +436,12 @@ class WindshieldWaterSimulator:
         for name, (h, a) in layers.items():                # visible share / peak of each water layer
             self.stats[f'alpha_cov_{name}'] = float((a > 0.05).float().mean())
             self.stats[f'layer_height_max_{name}'] = float(h.max())
-        off = maps.offset_px.norm(dim=0)[maps.alpha > 0.05]
+        mag = maps.offset_px.norm(dim=0)
+        off = mag[maps.alpha > 0.05]
         self.stats['offset_p99_px'] = float(torch.quantile(off.float()[:200000], 0.99)) if off.numel() else 0.0
+        thin_only = (maps.alpha > 0.05) & (layers['drops'][1] < 0.05)     # refraction of trails / rivulets / film / splashes
+        off_t = mag[thin_only]
+        self.stats['offset_thin_p90_px'] = float(torch.quantile(off_t.float()[:200000], 0.9)) if off_t.numel() else 0.0
         self.stats['render_ms'] = 1000 * (time.perf_counter() - t0)
         self.last_maps = maps
         return maps

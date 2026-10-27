@@ -55,7 +55,12 @@ class MetricsRecorder:
             else:
                 out[f'{k}_mean'] = float(v.mean())
         n = len(self.rows)
-        for k in ('arrivals', 'merges', 'impacts', 'splashes_new'):
+        ended = sum(r.get('splashes_ended', 0) for r in self.rows)
+        if ended:
+            out['splash_duration_mean_s'] = sum(r.get('splash_duration_sum', 0.0) for r in self.rows) / ended
+        if out.get('alpha_cov_film_mean', 0) > 0:
+            out['trail_to_film_ratio'] = out.get('alpha_cov_trails_mean', 0.0) / out['alpha_cov_film_mean']
+        for k in ('arrivals', 'merges', 'impacts', 'drop_hits', 'impact_events', 'splashes_new'):
             if any(k in r for r in self.rows):
                 out[f'{k}_per_s'] = sum(r.get(k, 0) for r in self.rows) * self.fps / n
         return out

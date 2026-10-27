@@ -94,7 +94,7 @@ class TrailConfig:
     deposit_per_px: float = 0.12                   # volume laid per px moved, x r
     decay_per_s: float = 0.8                       # D(t + dt) = D(t) exp(-mu dt)
     min_strength: float = 0.03
-    height: float = 0.25                           # trail height (relative to drop caps)
+    height: float = 0.8                            # px; narrow trace -> gentle local refraction
     alpha: float = 0.55
 
 
@@ -110,7 +110,7 @@ class RivuletConfig:
     flow_px_s: float = 60.0                        # downward transport, x clip(F, 0.3, 1.5)
     absorb_per_s: float = 0.5                      # drops on a rivulet transfer water into it
     min_component_cells: int = 6
-    height: float = 0.35
+    height: float = 2.0                            # px; thicker connected path
     alpha: float = 0.6
 
 
@@ -128,7 +128,7 @@ class FilmConfig:
     rivulet_overflow: float = 0.3                  # rivulet water above 2 x threshold spills into film
     visible: float = 0.15                          # film counted / drawn above this
     full_level: float = 0.6                        # film drawn at full height / alpha from this level
-    height: float = 0.15
+    height: float = 3.0                            # px over broad regions -> broad, gentle distortion
     max_alpha: float = 0.25
 
 
@@ -156,9 +156,9 @@ class SplashConfig:
     satellites_mean: float = 1.5                   # x strength
     satellite_r_px: Tuple[float, float] = (1.8, 3.5)
     residual_drop_frac: float = 0.6                # remaining budget -> droplet; the rest -> film
-    height: float = 1.2                            # px at radius_ref, x (R_max / R_ref)^exp, capped
+    height: float = 2.0                            # px at radius_ref, x (R_max / R_ref)^exp, capped
     height_size_exp: float = 1.0
-    height_cap: float = 2.0
+    height_cap: float = 1.5                        # x height: at most 3 px
     alpha: float = 0.7
     ambient_rate_per_s: float = 0.0                # optional independent events (off: impacts drive splashes)
     ambient_water_per_px2: float = 0.6
@@ -170,7 +170,7 @@ class RenderConfig:
     edge_px: float = 1.0                           # anti-aliased drop edge
     max_patch: int = 161
     patch_buckets: Tuple[int, ...] = (25, 41, 65, 97, 129)
-    composition: str = 'max'                       # 'max' (baseline) | 'layered' (see simulator.compose)
+    composition: str = 'layered'                   # 'layered' (see simulator.compose) | 'max' (old baseline)
     thin_cap_px: float = 4.0                       # cap of the combined thin-water height (layered)
 
 
@@ -245,11 +245,18 @@ def preset(name: str) -> SimConfig:
         c.growth.min_radius_px = 2.2
         c.motion.slide_radius_px, c.motion.v_max_px_s = 16.0, 90.0
         c.trails.decay_per_s, c.trails.width_frac = 1.2, 0.30
-        c.splash.impact_prob = 0.02
+        c.splash.impact_prob = 0.02                 # rare splashes
+        c.rivulets.enabled = True                   # rare rivulets: only where many trails coincide
+        c.rivulets.threshold = 0.9
+        c.film.enabled = True                       # little film
+        c.film_mult, c.film.max_alpha = 0.5, 0.2
     elif name == 'steady':
         # uneven sizes, regular sliding, visible trails, merging, local film patches
         c.film.enabled = True
         c.film.max_alpha = 0.3
+        c.rivulets.enabled = True                   # local rivulets
+        c.rivulets.threshold = 0.7
+        c.splash.impact_prob = 0.04                 # occasional splashes
     elif name == 'heavy':
         # larger and faster drops, frequent impacts, growth, merging, rivulets, broad film
         c.intensity = 160 / 90
@@ -266,7 +273,7 @@ def preset(name: str) -> SimConfig:
         c.film.enabled = True
         c.film.max_alpha = 0.4
         c.film_mult = 0.56                          # keeps the pre-fix film level (0.06 / 1.78); re-tuned later
-        c.splash.impact_prob, c.splash.satellites_mean = 0.05, 2.5
+        c.splash.impact_prob, c.splash.satellites_mean = 0.09, 2.5     # common splashes
     elif name == 'torrential':
         # dense accumulation, connected rivulets, strong film, frequent splashes
         c.intensity = 300 / 90
@@ -283,7 +290,7 @@ def preset(name: str) -> SimConfig:
         c.film.max_alpha = 0.6
         c.film_mult = 0.45                          # keeps the pre-fix film level (0.09 / 3.33); re-tuned later
         c.film.advect_cells_s = 6.0
-        c.splash.impact_prob, c.splash.satellites_mean = 0.06, 3.0
+        c.splash.impact_prob, c.splash.satellites_mean = 0.06, 3.0     # very common (more impacts)
     else:
         raise ValueError(f'unknown scenario {name!r}; choose from {SCENARIOS}')
     return c.validate()
