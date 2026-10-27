@@ -74,6 +74,42 @@ class RainField:
         return cv2.resize(self.grid, (gw, gh), interpolation=cv2.INTER_LINEAR)
 
 
+class LiveIndex:
+    """Spatial hash of drops that is updated as arrivals create / grow drops, so later
+    arrivals in the same step see the current water (no stale snapshot)."""
+
+    def __init__(self, drops, cell=32.0):
+        self.cell = cell
+        self.cells = {}
+        self.rmax = 0.0
+        for d in drops.values():
+            self.insert(d)
+
+    def _key(self, x, y):
+        return int(x // self.cell), int(y // self.cell)
+
+    def insert(self, d):
+        self.cells.setdefault(self._key(d.x, d.y), []).append(d)
+        self.rmax = max(self.rmax, d.radius)
+
+    def grew(self, d):
+        self.rmax = max(self.rmax, d.radius)
+
+    def nearest_contact(self, x, y, r):
+        """Drop whose footprint touches the arrival: d_ij <= r_i + r_j (closest centre)."""
+        reach = r + self.rmax
+        k = int(math.ceil(reach / self.cell))
+        cx, cy = self._key(x, y)
+        best, best_d = None, float('inf')
+        for gx in range(cx - k, cx + k + 1):
+            for gy in range(cy - k, cy + k + 1):
+                for d in self.cells.get((gx, gy), ()):
+                    dist = math.hypot(d.x - x, d.y - y)
+                    if dist <= d.radius + r and dist < best_d:
+                        best, best_d = d, dist
+        return best
+
+
 class WindshieldWaterSimulator:
     def __init__(self, width: int, height: int, config, seed: int = 0, device='cuda',
                  rain_intensity: float = 1.0):
@@ -92,6 +128,8 @@ class WindshieldWaterSimulator:
         self.rivulets = DepositionField(self.cfg, height, width) if self.cfg.rivulets.enabled else None
         self.film = FilmField(self.cfg, height, width) if self.cfg.film.enabled else None
         self.splashes = SplashSystem(self.cfg)
+        self.water = {'arrived': 0.0, 'to_drops': 0.0, 'to_splash': 0.0}   # arrival ledger (volume)
+        self.arrival_log = []
         self.stats: dict = {}
         self.merge_events = []
         self._prev_drawn = {}
@@ -124,30 +162,52 @@ class WindshieldWaterSimulator:
 
     # ------------------------------------------------------------------ processes
     def _arrivals(self):
-        """N_t ~ Poisson(lambda dt). An arrival inside an existing drop feeds it."""
-        sp, k = self.cfg.spawn, self.cfg.growth.volume_k
-        n = int(self.rng.poisson(sp.rate_per_s * self.rain_intensity * self.dt))
-        impacts = 0
-        # impacts are tested against the drops that existed before this step's arrivals
-        ids = list(self.drops)
-        arr = np.array([(d.x, d.y, d.radius) for d in self.drops.values()]) if ids else None
+        """Rain ARRIVALS (water entering the windshield system), N_t ~ Poisson(lambda dt),
+        lambda = base_rate x I x clip intensity. For each arrival, in order:
+          1. sample position (rain field) and radius (size mixture)
+          2. find an existing drop in contact, d_ij <= r_i + r_j (live index)
+          3. hit  -> its water joins that drop;   miss -> a new drop
+          4. the impact may trigger a splash AT THE IMPACT POINT, with probability
+             impact_prob x strength x (dry_factor on dry glass .. 1 on water); the splash
+             carries water_frac of the arriving volume (counted once - see ledger)
+        Drop-drop COLLISIONS (two existing water bodies) are handled in _merge."""
+        sp, sc, k = self.cfg.spawn, self.cfg.splash, self.cfg.growth.volume_k
+        lam = sp.base_rate_per_s * self.cfg.intensity * self.rain_intensity
+        n = int(self.rng.poisson(lam * self.dt))
+        index = LiveIndex(self.drops)
+        hits = impact_events = 0
+        self.arrival_log = []                            # (x, y, r, hit_id or -1, splashed) this step
         for _ in range(n):
             x, y = self.rain.sample(self.rng) if sp.use_rain_field else (self.rng.uniform(0, self.W),
                                                                           self.rng.uniform(0, self.H))
             r = self._sample_radius()
-            if arr is not None:
-                dd = np.hypot(arr[:, 0] - x, arr[:, 1] - y)
-                hit = np.nonzero(dd < arr[:, 2])[0]
-                if hit.size:
-                    tgt = self.drops.get(ids[int(hit[np.argmin(dd[hit])])])
-                    if tgt is not None:
-                        tgt.volume += k * r ** 3          # growth on impact, no new object
-                        impacts += 1
-                        continue
-            self.make_drop(x, y, k * r ** 3)
-        new_splash = self.splashes.spawn(self.rng, self.W, self.H, self.dt,
-                                         self.rain.sample if sp.use_rain_field else None)
-        self.stats.update(arrivals=n, impacts=impacts, splashes_new=new_splash)
+            vol = k * r ** 3
+            self.water['arrived'] += vol
+            tgt = index.nearest_contact(x, y, r)
+            # splash decision from the impact itself
+            u = sc.impact_speed_ref * (r / sc.impact_radius_ref) ** sc.speed_exp
+            strength = min(1.0, (r / sc.impact_radius_ref) ** 3 * (u / sc.impact_speed_ref) ** 2)
+            wet = 1.0 if tgt is not None else (self.film.level_at(x, y) if self.film is not None else 0.0)
+            p = sc.impact_prob * strength * (sc.dry_factor + (1 - sc.dry_factor) * min(wet, 1.0))
+            to_splash = 0.0
+            if sc.enabled and self.rng.random() < p:
+                if self.splashes.trigger(self.rng, x, y, vol, u, sc.water_frac * vol) is not None:
+                    to_splash = sc.water_frac * vol
+                    impact_events += 1
+            self.arrival_log.append((x, y, r, tgt.drop_id if tgt is not None else -1, to_splash > 0))
+            rest = vol - to_splash
+            self.water['to_splash'] += to_splash
+            self.water['to_drops'] += rest
+            if tgt is not None:
+                tgt.volume += rest                       # arrival joins the drop it hit
+                index.grew(tgt)
+                hits += 1
+            else:
+                index.insert(self.make_drop(x, y, rest))
+        ambient = self.splashes.spawn_ambient(self.rng, self.W, self.H, self.dt,
+                                              self.rain.sample if sp.use_rain_field else None)
+        self.stats.update(arrivals=n, drop_hits=hits, impact_events=impact_events,
+                          splashes_new=impact_events + ambient)
 
     def _growth(self):
         """dV/dt = g_max R(x, y) r^2 (pinned drops collect rain) - evaporation V."""
@@ -244,12 +304,19 @@ class WindshieldWaterSimulator:
             ex = np.maximum(self.rivulets.F - 2 * rc.threshold, 0) * self.cfg.film.rivulet_overflow
             self.rivulets.F -= ex
             overflow = cv2.resize(ex, (self.film.gw, self.film.gh), interpolation=cv2.INTER_AREA) * 0.1
-        self.film.update(self.dt, self.rain.resized(self.film.gh, self.film.gw) * self.rain_intensity, overflow)
-        self.stats.update(film_coverage=self.film.coverage(), film_mean=float(self.film.F.mean()))
+        # spatial pattern and global intensity are passed separately (no cancellation)
+        self.film.update(self.dt, self.rain.resized(self.film.gh, self.film.gw),
+                         intensity=self.cfg.intensity * self.rain_intensity, overflow=overflow)
+        self.stats.update(film_coverage=self.film.coverage(), film_mean=float(self.film.F.mean()),
+                          film_saturation_fraction=float((self.film.F >= 0.99).mean()))
 
     def _splashes(self):
         self.splashes.update(self.dt, self.rng, lambda x, y, v: self.make_drop(x, y, v), self.film)
-        self.stats['splashes_active'] = len(self.splashes.events)
+        areas = self.splashes.area_px()
+        self.stats.update(splashes_active=len(self.splashes.events),
+                          splash_area_mean=float(np.mean(areas)) if areas else 0.0,
+                          splashes_ended=len(self.splashes.finished),
+                          splash_duration_sum=float(sum(d for d, _ in self.splashes.finished)))
 
     def _remove(self):
         g = self.cfg.growth
@@ -311,38 +378,65 @@ class WindshieldWaterSimulator:
         for _ in range(n):
             self.step()
 
-    def render_maps(self) -> WaterMaps:
-        """Rasterise the current state (does not change it)."""
+    def layer_maps(self):
+        """Per-layer (height, alpha) as H x W tensors, before composition."""
         H, W, dev = self.H, self.W, self.device
-        t0 = time.perf_counter()
         h_drop, a_drop = droplet_layer(list(self.drops.values()), H, W, self.cfg, dev)
-        layers = {'drops': a_drop}
-        height = h_drop
-        alpha = a_drop
+        layers = {'drops': (h_drop, a_drop)}
 
-        def add(name, h_np, alpha_scale, ref):
-            nonlocal height, alpha
+        def thin(name, h_np, alpha_scale, ref):
             h = torch.from_numpy(h_np).to(dev)
-            a = (h / max(ref, 1e-6)).clamp(0, 1) * alpha_scale
-            layers[name] = a
-            height = torch.maximum(height, h)
-            alpha = torch.maximum(alpha, a)
+            layers[name] = (h, (h / max(ref, 1e-6)).clamp(0, 1) * alpha_scale)
 
         tc = self.cfg.trails
         if tc.enabled and self.trails.trails:
-            add('trails', self.trails.rasterize(H, W), tc.alpha, tc.height)
+            thin('trails', self.trails.rasterize(H, W), tc.alpha, tc.height)
         if self.rivulets is not None:
             rc = self.cfg.rivulets
-            add('rivulets', self.rivulets.rasterize(H, W), rc.alpha, rc.height)
+            thin('rivulets', self.rivulets.rasterize(H, W), rc.alpha, rc.height)
         if self.film is not None:
             fc = self.cfg.film
-            add('film', self.film.rasterize(H, W), fc.max_alpha, fc.height)
+            thin('film', self.film.rasterize(H, W), fc.max_alpha, fc.height)
         if self.splashes.events:
-            add('splashes', self.splashes.rasterize(H, W), 1.0, self.cfg.splash.height)
-        maps = height_to_maps(height, alpha, self.cfg, layers)
+            h_s, a_s = self.splashes.rasterize(H, W, self.dt)
+            layers['splashes'] = (torch.from_numpy(h_s).to(dev), torch.from_numpy(a_s).to(dev))
+        return layers
+
+    def compose(self, layers):
+        """Combine layers into one height + alpha.
+        'max'     : height = max_j h_j, alpha = max_j a_j            (baseline)
+        'layered' : thin water on the glass  h_thin = film + max(rivulet, trail) + splash
+                    (a rivulet sits on wet film; a trail inside a rivulet is the same water),
+                    capped; drops sit ON TOP of it: h = h_drop + h_thin;
+                    alpha = 1 - prod_j (1 - a_j)  (independent-layer approximation)"""
+        zero = torch.zeros_like(layers['drops'][0])
+        get = lambda k: layers[k] if k in layers else (zero, zero)
+        if self.cfg.render.composition == 'max':
+            height, alpha = zero.clone(), zero.clone()
+            for h, a in layers.values():
+                height, alpha = torch.maximum(height, h), torch.maximum(alpha, a)
+            return height, alpha
+        h_thin = get('film')[0] + torch.maximum(get('rivulets')[0], get('trails')[0]) + get('splashes')[0]
+        h_thin = h_thin.clamp(max=self.cfg.render.thin_cap_px)
+        height = get('drops')[0] + h_thin
+        transmit = torch.ones_like(zero)
+        for _, a in layers.values():
+            transmit = transmit * (1 - a.clamp(0, 1))
+        return height, 1 - transmit
+
+    def render_maps(self) -> WaterMaps:
+        """Rasterise the current state (does not change it)."""
+        t0 = time.perf_counter()
+        layers = self.layer_maps()
+        height, alpha = self.compose(layers)
+        maps = height_to_maps(height, alpha, self.cfg, {k: a for k, (h, a) in layers.items()})
+        maps.layer_heights = {k: h for k, (h, a) in layers.items()}
         self.stats['coverage'] = float((maps.alpha > 0.05).float().mean())
-        for name, a in layers.items():                     # visible share of each water layer
+        for name, (h, a) in layers.items():                # visible share / peak of each water layer
             self.stats[f'alpha_cov_{name}'] = float((a > 0.05).float().mean())
+            self.stats[f'layer_height_max_{name}'] = float(h.max())
+        off = maps.offset_px.norm(dim=0)[maps.alpha > 0.05]
+        self.stats['offset_p99_px'] = float(torch.quantile(off.float()[:200000], 0.99)) if off.numel() else 0.0
         self.stats['render_ms'] = 1000 * (time.perf_counter() - t0)
         self.last_maps = maps
         return maps

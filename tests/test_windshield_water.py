@@ -25,7 +25,7 @@ W, H = 320, 240
 
 def quiet(name='steady', **over):
     """Preset with every process off unless switched back on by `over`."""
-    base = {'spawn': {'rate_per_s': 0.0}, 'splash': {'enabled': False}, 'merge': {'enabled': False},
+    base = {'spawn': {'base_rate_per_s': 0.0}, 'splash': {'enabled': False}, 'merge': {'enabled': False},
             'trails': {'enabled': False}, 'film': {'enabled': False}, 'rivulets': {'enabled': False},
             'growth': {'g_max': 0.0, 'evaporation_per_s': 0.0}}
     for k, v in over.items():
@@ -71,7 +71,7 @@ def test_droplet_id_persists_while_state_evolves():
 
 # Step 4 -- continuous Poisson arrivals, size mixture ------------------------------------
 def test_arrivals_change_population_and_old_ids_survive():
-    cfg = quiet(spawn={'rate_per_s': 90.0}, motion={'slide_radius_px': 1e6})   # no sliding / merging
+    cfg = quiet(spawn={'base_rate_per_s': 90.0}, motion={'slide_radius_px': 1e6})   # no sliding / merging
     sim = sim_with(cfg)
     counts, early, arrivals = [], None, 0
     for f in range(100):
@@ -234,7 +234,7 @@ def test_film_update_is_stable():
 
 # Step 12 -- splashes ------------------------------------------------------------------
 def test_splash_spreads_relaxes_ends_and_leaves_water():
-    cfg = quiet(splash={'enabled': True, 'rate_per_s': 0.0}, film={'enabled': True, 'source_per_s': 0.0})
+    cfg = quiet(splash={'enabled': True}, film={'enabled': True, 'source_per_s': 0.0})
     sim = sim_with(cfg)
     ev = SplashEvent(x=160.0, y=120.0, water_amount=300.0, age=0.0, duration=0.5,
                      initial_radius=4.0, strength=1.0, max_radius=16.0,
@@ -245,13 +245,15 @@ def test_splash_spreads_relaxes_ends_and_leaves_water():
     while sim.splashes.events:
         radii.append(ev.radius(cfg.splash.tau_s))
         sim.step()
-    assert all(b >= a for a, b in zip(radii, radii[1:])) and radii[-1] > 0.9 * 16.0
+    grow = radii[:int(0.7 * len(radii))]                                   # until the transfer stage
+    assert all(b >= a for a, b in zip(grow, grow[1:])) and max(radii) > 0.9 * 16.0
+    assert radii[-1] < max(radii)                                          # then recedes
     assert len(radii) <= int(0.5 * cfg.fps) + 2                         # temporary
     assert len(sim.drops) >= 1 or sim.film.F.max() > 0                   # leaves water behind
 
 
 def test_splashes_respect_minimum_spacing():
-    cfg = quiet(splash={'enabled': True, 'rate_per_s': 3000.0, 'min_spacing_px': 60.0})
+    cfg = quiet(splash={'enabled': True, 'ambient_rate_per_s': 3000.0, 'min_spacing_px': 60.0})
     sim = sim_with(cfg)
     sim.step()
     ev = sim.splashes.events
@@ -290,7 +292,7 @@ def test_heavier_presets_get_more_water(lo, hi):
         for _ in range(30):
             sim.step()
             vals.append(float((sim.render_maps().alpha > 0.05).float().mean()))
-        return np.mean(vals), sim.cfg.spawn.rate_per_s
+        return np.mean(vals), sim.cfg.spawn.base_rate_per_s * sim.cfg.intensity
     (c_lo, r_lo), (c_hi, r_hi) = cov(lo), cov(hi)
     assert r_lo < r_hi and c_lo < c_hi
 
@@ -300,3 +302,168 @@ def test_invalid_config_is_rejected():
         apply_overrides(preset('steady'), {'merge': {'contact_frac': 1.5}})
     with pytest.raises(ValueError):
         apply_overrides(preset('steady'), {'no_such_group': {}})
+
+
+# ======================== fixes: impacts, splashes, film intensity, composition ==========
+def test_impacts_use_both_radii_and_conserve_water():
+    """Arrival touching a drop's edge (d <= r_i + r_j) is a hit; every arriving volume is
+    accounted for exactly once; splashes sit at real impact points."""
+    cfg = quiet(spawn={'base_rate_per_s': 3000.0}, splash={'enabled': True, 'impact_prob': 1.0, 'dry_factor': 1.0},
+                motion={'slide_radius_px': 1e6})
+    sim = sim_with(cfg)
+    impacts = []
+    for _ in range(100):
+        before = len(sim.splashes.events)
+        sim.step()
+        new = sim.splashes.events[before:] if len(sim.splashes.events) > before else []
+        log = sim.arrival_log
+        assert sim.stats['arrivals'] == len(log)
+        for ev in [e for e in sim.splashes.events if e.age <= sim.dt + 1e-9]:
+            assert any(abs(ev.x - x) < 1e-9 and abs(ev.y - y) < 1e-9 and sp for x, y, _, _, sp in log)
+        impacts.append((sim.stats['arrivals'], sim.stats['drop_hits'], sim.stats['impact_events']))
+        w = sim.water
+        assert abs(w['arrived'] - (w['to_drops'] + w['to_splash'])) <= 1e-9 * max(w['arrived'], 1)
+    a, h, i = np.sum(impacts, 0)
+    assert a > 0 and h > 0 and i > 0
+    # splash water: budget = given to drops + film + still held by active events
+    led = sim.splashes.ledger
+    held = sum(e.water_amount for e in sim.splashes.events)
+    assert abs(led['budget'] - (led['to_drops'] + led['to_film'] + held)) <= 1e-6 * max(led['budget'], 1)
+
+
+def test_arrival_at_drop_edge_is_a_hit_and_same_step_arrivals_see_new_drops():
+    cfg = quiet(spawn={'base_rate_per_s': 0.0}, motion={'slide_radius_px': 1e6})
+    sim = sim_with(cfg)
+    d = sim.make_drop(100.0, 100.0, 6.0 ** 3)
+    # arrival of radius 3 at distance 8.5: outside r_i = 6 (old test missed it), inside r_i + r_j = 9
+    seq = iter([(108.5, 100.0, 3.0), (200.0, 50.0, 4.0), (202.0, 50.0, 2.5)])
+    sim.rain.sample = lambda rng: next(seq)[:2]
+    radii = iter([3.0, 4.0, 2.5])
+    sim._sample_radius = lambda: next(radii)
+    class FixedCount:                                     # exactly 3 arrivals this step
+        def __init__(self, rng):
+            self._rng = rng
+
+        def poisson(self, lam):
+            return 3
+
+        def __getattr__(self, name):
+            return getattr(self._rng, name)
+    sim.rng = FixedCount(sim.rng)
+    sim.cfg.spawn.base_rate_per_s = 1.0
+    v0 = d.volume
+    sim._arrivals()
+    log = sim.arrival_log
+    assert log[0][3] == d.drop_id and abs(d.volume - (v0 + 27.0)) < 1e-9      # edge contact = hit
+    assert log[1][3] == -1                                                     # new drop on dry glass
+    assert log[2][3] != -1 and log[2][3] != d.drop_id                          # ... seen by the next arrival
+
+
+def _single_impact(rmax_drop=8.0, frames=40, save_dir=None):
+    cfg = quiet(splash={'enabled': True}, film={'enabled': True, 'source_per_s': 0.0})
+    sim = sim_with(cfg)
+    vol = rmax_drop ** 3
+    ev = sim.splashes.trigger(sim.rng, 160.0, 120.0, vol, 1.0, 0.6 * vol)
+    rows = []
+    for f in range(frames):
+        sim.step()                                        # same order as the simulator: update, then draw
+        h, a = sim.splashes.rasterize(H, W, sim.dt) if sim.splashes.events else (np.zeros((H, W)), np.zeros((H, W)))
+        rows.append((float((a > 0.05).sum()), float(h.max()), float(a.sum()), len(sim.splashes.events)))
+        if save_dir is not None and f in (0, 2, 5, 10, 15, 20, 25):
+            import cv2
+            cv2.imwrite(os.path.join(save_dir, f'splash_t{f:02d}_alpha.png'), (np.clip(a, 0, 1) * 255).astype(np.uint8))
+            cv2.imwrite(os.path.join(save_dir, f'splash_t{f:02d}_height.png'),
+                        (np.clip(h / max(h.max(), 1e-6), 0, 1) * 255).astype(np.uint8))
+    return sim, ev, rows
+
+
+def test_single_impact_expands_relaxes_and_leaves_water(tmp_path):
+    sim, ev, rows = _single_impact(save_dir=str(tmp_path))
+    vis = [r for r in rows if r[3]]
+    areas, water = [r[0] for r in vis], [r[2] for r in vis]
+    peak = int(np.argmax(areas))
+    assert 0 < areas[0] < 0.35 * areas[peak]               # appears small (impact) ...
+    assert all(b >= a - 1e-6 for a, b in zip(areas[:peak], areas[1:peak + 1]))   # ... expands
+    assert areas[-1] < 0.2 * areas[peak]                   # nearly gone before removal: no pop
+    wsteps = np.abs(np.diff(water[2:])) / max(max(water), 1e-6)
+    assert wsteps.max() < 0.25                             # visible water changes smoothly
+    assert not sim.splashes.events                         # temporary
+    assert len(sim.drops) >= 1 or sim.film.F.sum() > 0      # residual water remains
+    led = sim.splashes.ledger
+    assert abs(led['budget'] - led['to_drops'] - led['to_film']) < 1e-6 * led['budget']
+    assert len(list(tmp_path.glob('splash_t*_alpha.png'))) == 7
+
+
+def test_splash_height_scales_with_size_but_is_capped():
+    s_small, ev_s, _ = _single_impact(rmax_drop=4.0, frames=1)
+    s_big, ev_b, _ = _single_impact(rmax_drop=12.0, frames=1)
+    s_huge, ev_h, _ = _single_impact(rmax_drop=60.0, frames=1)
+    hs, hb, hh = (s.splashes.peak_height(e) for s, e in ((s_small, ev_s), (s_big, ev_b), (s_huge, ev_h)))
+    assert hs < hb <= hh <= s_huge.cfg.splash.height * s_huge.cfg.splash.height_cap + 1e-9
+
+
+def test_film_source_follows_global_intensity():
+    """Same initial film and rain pattern; only the global intensity differs."""
+    from windshield_water.film import FilmField
+    cfg = preset('steady')
+    rain = sim_with(cfg).rain.resized(*FilmField(cfg, H, W).F.shape)
+    runs = {}
+    for I in (1.0, 2.0):
+        f = FilmField(cfg, H, W)
+        cov = []
+        for _ in range(60):
+            f.update(cfg.dt, rain, intensity=I)
+            cov.append(f.coverage())
+        runs[I] = (f.F.mean(), cov)
+    assert runs[2.0][0] > 1.5 * runs[1.0][0]                       # accumulates faster
+    assert runs[2.0][1][-1] > runs[1.0][1][-1]                     # reaches more coverage
+
+
+def _composite(case, mode):
+    cfg = quiet(render={'composition': mode}, trails={'enabled': True}, splash={'enabled': True},
+                film={'enabled': True, 'source_per_s': 0.0}, rivulets={'enabled': True})
+    sim = sim_with(cfg)
+    d = sim.make_drop(160.0, 120.0, 12.0 ** 3)
+    d.opacity = 1.0
+    if case == 'trail':
+        sim.trails.trails[0] = __import__('windshield_water.trails', fromlist=['Trail']).Trail(
+            0, -1, [[160.0, 60.0, 4.0, 1.0], [160.0, 180.0, 4.0, 1.0]])
+    if case == 'splash':
+        sim.splashes.trigger(sim.rng, 165.0, 120.0, 10.0 ** 3, 1.0, 300.0)
+        sim.splashes.events[0].age = 0.1
+    if case == 'rivulet':
+        sim.rivulets.F[:, 160 // 4 - 1:160 // 4 + 2] = 1.0
+    if case == 'film':
+        sim.film.F[:] = 0.5
+        e = sim.make_drop(200.0, 120.0, 8.0 ** 3)
+        e.opacity = 1.0
+    return sim, sim.layer_maps(), sim.render_maps()
+
+
+@pytest.mark.parametrize('case', ['trail', 'splash', 'rivulet', 'film'])
+def test_layered_composition_keeps_the_layer_under_a_drop(case):
+    _, layers_m, m_max = _composite(case, 'max')
+    _, layers_l, m_lay = _composite(case, 'layered')
+    drop_h = layers_l['drops'][0]
+    inside = drop_h > 0.5 * drop_h.max()
+    other = [k for k in layers_l if k != 'drops']
+    thin = sum(layers_l[k][0] for k in other)
+    under = inside & (thin > 1e-3)
+    assert under.any()
+    # max-composition hides the thin layer under the drop; layered keeps it
+    assert torch.allclose(m_max.height[under], drop_h[under], atol=1e-5)
+    assert (m_lay.height[under] > drop_h[under] + 1e-4).all()
+    # opacity: 1 - prod(1 - a) is at least the strongest layer, more where layers overlap
+    amax = torch.stack([a for _, a in layers_l.values()]).max(0).values
+    assert (m_lay.alpha >= amax - 1e-6).all()
+
+
+def test_isolated_drop_is_identical_under_both_compositions():
+    cfg_m, cfg_l = quiet(render={'composition': 'max'}), quiet(render={'composition': 'layered'})
+    out = []
+    for cfg in (cfg_m, cfg_l):
+        sim = sim_with(cfg)
+        d = sim.make_drop(160.0, 120.0, 10.0 ** 3)
+        d.opacity = 1.0
+        out.append(sim.render_maps())
+    assert torch.allclose(out[0].height, out[1].height) and torch.allclose(out[0].alpha, out[1].alpha)

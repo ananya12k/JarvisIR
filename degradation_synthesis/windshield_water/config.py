@@ -24,7 +24,7 @@ class SizeComponent:
 
 @dataclass
 class SpawnConfig:
-    rate_per_s: float = 90.0                       # lambda: N_t ~ Poisson(lambda * dt)
+    base_rate_per_s: float = 90.0                  # lambda = base * I (scenario intensity): N_t ~ Poisson(lambda dt)
     size_mixture: List[SizeComponent] = field(default_factory=lambda: [
         SizeComponent(0.80, 4.5, 0.50), SizeComponent(0.20, 11.0, 0.35)])
     r_min_px: float = 2.0
@@ -118,7 +118,9 @@ class RivuletConfig:
 class FilmConfig:
     enabled: bool = False
     grid_px: int = 4
-    source_per_s: float = 0.06                     # S = source * R^gamma / mean(R^gamma) (+ splash / overflow)
+    source_per_s: float = 0.06                     # s0: S = s0 G(I) R^gamma / mean(R^gamma) (+ splash / overflow)
+    intensity_exponent: float = 1.0                # G(I) = I^kappa (monotonic); I survives the spatial normalisation
+    depth_px: float = 2.0                          # water depth of a full film (F = 1): volume -> film level
     rain_exponent: float = 3.0                     # gamma > 1 concentrates film where rain is densest
     loss_per_s: float = 0.5                        # L = loss * F  -> patchy equilibrium F ~ S / L
     diffusion_cells2_s: float = 3.0                # D in div(D grad F): local spreading only
@@ -132,23 +134,34 @@ class FilmConfig:
 
 @dataclass
 class SplashConfig:
+    """Splashes are caused by rain impacts (simulator._arrivals -> trigger)."""
     enabled: bool = True
-    rate_per_s: float = 1.0
-    min_spacing_px: float = 40.0
-    refractory_s: float = 0.3
-    r_max_px: Tuple[float, float] = (10.0, 25.0)
+    impact_prob: float = 0.03                      # scenario control: chance an impact makes a visible splash ...
+    dry_factor: float = 0.3                        # ... x this on dry glass (x 1 on a drop / wet film)
+    water_frac: float = 0.6                        # share of the arriving drop's water carried by the splash
+    impact_speed_ref: float = 1.0                  # impact speed u (relative; u ~ (r / r_ref)^speed_exp)
+    speed_exp: float = 0.5                         # terminal speed grows ~ sqrt(drop size)
+    impact_radius_ref: float = 8.0                 # px: impact radius with strength 1 at u = 1
+    radius_per_drop_radius: float = 2.2            # R_max ~ this x r_impact x sqrt(u)
+    radius_ref_px: float = 15.0                    # reference event size (duration / height scaling)
+    min_spacing_px: float = 30.0
+    refractory_s: float = 0.2
+    r_max_px: Tuple[float, float] = (6.0, 32.0)    # clip of R_max
     r0_frac: float = 0.3                           # R(t) = R0 + (Rmax - R0)(1 - exp(-t / tau))
     tau_s: float = 0.08
-    duration_s: float = 0.6
-    relax_s: float = 0.25                          # irregularity relaxes with exp(-t / relax)
-    fingers: Tuple[int, int] = (3, 7)
+    duration_s: float = 0.6                        # x sqrt(R_max / radius_ref)
+    relax_s: float = 0.25                          # rim / fingers relax with exp(-t / relax)
+    fingers: Tuple[int, int] = (2, 7)              # count grows with impact strength
     finger_amp: float = 0.35
-    satellites_mean: float = 1.5
+    satellites_mean: float = 1.5                   # x strength
     satellite_r_px: Tuple[float, float] = (1.8, 3.5)
-    residual_drop_frac: float = 0.5                # water left as a droplet when the event ends
-    residual_film_frac: float = 0.5                # ... and as film
-    water_per_px2: float = 0.6                     # splash water ~ this x Rmax^2
-    height: float = 0.3
+    residual_drop_frac: float = 0.6                # remaining budget -> droplet; the rest -> film
+    height: float = 1.2                            # px at radius_ref, x (R_max / R_ref)^exp, capped
+    height_size_exp: float = 1.0
+    height_cap: float = 2.0
+    alpha: float = 0.7
+    ambient_rate_per_s: float = 0.0                # optional independent events (off: impacts drive splashes)
+    ambient_water_per_px2: float = 0.6
 
 
 @dataclass
@@ -157,6 +170,8 @@ class RenderConfig:
     edge_px: float = 1.0                           # anti-aliased drop edge
     max_patch: int = 161
     patch_buckets: Tuple[int, ...] = (25, 41, 65, 97, 129)
+    composition: str = 'max'                       # 'max' (baseline) | 'layered' (see simulator.compose)
+    thin_cap_px: float = 4.0                       # cap of the combined thin-water height (layered)
 
 
 @dataclass
@@ -164,6 +179,9 @@ class SimConfig:
     name: str = 'steady'
     fps: float = 30.0
     warmup_s: float = 10.0
+    # scenario-level controls; lower-level rates are derived from these
+    intensity: float = 1.0                         # I: arrivals = base_rate x I, film source x G(I)
+    film_mult: float = 1.0                         # film source multiplier on top of G(I)
     spawn: SpawnConfig = field(default_factory=SpawnConfig)
     rain_field: RainFieldConfig = field(default_factory=RainFieldConfig)
     growth: GrowthConfig = field(default_factory=GrowthConfig)
@@ -186,7 +204,9 @@ class SimConfig:
             if not cond:
                 raise ValueError(f'[{self.name}] {msg}')
         need(self.fps > 0, 'fps must be > 0')
-        need(self.spawn.rate_per_s >= 0, 'spawn rate must be >= 0')
+        need(self.spawn.base_rate_per_s >= 0 and self.intensity >= 0, 'rates / intensity must be >= 0')
+        need(0 <= self.splash.impact_prob <= 1, 'splash.impact_prob must be in [0, 1]')
+        need(0 <= self.splash.water_frac <= 1 and 0 <= self.splash.residual_drop_frac <= 1, 'bad splash fractions')
         need(len(self.spawn.size_mixture) > 0, 'size_mixture is empty')
         need(sum(c.weight for c in self.spawn.size_mixture) > 0, 'size_mixture weights sum to 0')
         need(all(c.median_px > 0 and c.sigma >= 0 for c in self.spawn.size_mixture), 'bad size component')
@@ -203,6 +223,7 @@ class SimConfig:
         need(self.film.loss_per_s > 0 or not self.film.enabled, 'film needs loss > 0 to reach equilibrium')
         need(self.splash.r0_frac < 1, 'splash r0_frac must be < 1')
         need(max(self.render.patch_buckets) < self.render.max_patch, 'patch buckets must be < max_patch')
+        need(self.render.composition in ('max', 'layered'), "render.composition must be 'max' or 'layered'")
         return self
 
 
@@ -217,21 +238,21 @@ def preset(name: str) -> SimConfig:
         # growth / evaporation balance radius g / e = 1.2 px < r_min: beads slowly
         # evaporate instead of piling up
         c.warmup_s = 30.0
-        c.spawn.rate_per_s = 30.0
+        c.intensity = 30 / 90
         c.spawn.size_mixture = [SizeComponent(0.90, 4.0, 0.45), SizeComponent(0.10, 10.0, 0.30)]
         c.growth.g_max, c.growth.evaporation_per_s = 0.18, 0.15
         c.spawn.r_min_px = 2.2
         c.growth.min_radius_px = 2.2
         c.motion.slide_radius_px, c.motion.v_max_px_s = 16.0, 90.0
         c.trails.decay_per_s, c.trails.width_frac = 1.2, 0.30
-        c.splash.rate_per_s = 0.3
+        c.splash.impact_prob = 0.02
     elif name == 'steady':
         # uneven sizes, regular sliding, visible trails, merging, local film patches
         c.film.enabled = True
-        c.film.source_per_s, c.film.max_alpha = 0.06, 0.3
+        c.film.max_alpha = 0.3
     elif name == 'heavy':
         # larger and faster drops, frequent impacts, growth, merging, rivulets, broad film
-        c.spawn.rate_per_s = 160.0
+        c.intensity = 160 / 90
         c.spawn.size_mixture = [SizeComponent(0.70, 5.0, 0.50), SizeComponent(0.30, 13.0, 0.35)]
         c.spawn.r_max_px = 26.0
         c.growth.g_max = 0.9
@@ -243,11 +264,12 @@ def preset(name: str) -> SimConfig:
         c.rivulets.enabled = True
         c.rivulets.deposit_gain, c.rivulets.decay_per_s, c.rivulets.threshold = 0.4, 0.3, 0.45
         c.film.enabled = True
-        c.film.source_per_s, c.film.max_alpha = 0.06, 0.4
-        c.splash.rate_per_s, c.splash.satellites_mean = 3.0, 2.5
+        c.film.max_alpha = 0.4
+        c.film_mult = 0.56                          # keeps the pre-fix film level (0.06 / 1.78); re-tuned later
+        c.splash.impact_prob, c.splash.satellites_mean = 0.05, 2.5
     elif name == 'torrential':
         # dense accumulation, connected rivulets, strong film, frequent splashes
-        c.spawn.rate_per_s = 300.0
+        c.intensity = 300 / 90
         c.spawn.size_mixture = [SizeComponent(0.65, 5.0, 0.50), SizeComponent(0.35, 14.0, 0.35)]
         c.spawn.r_max_px = 28.0
         c.growth.g_max = 1.2
@@ -258,10 +280,10 @@ def preset(name: str) -> SimConfig:
         c.rivulets.threshold, c.rivulets.flow_px_s = 0.4, 80.0
         c.rivulets.deposit_gain, c.rivulets.decay_per_s = 0.6, 0.25
         c.film.enabled = True
-        c.film.source_per_s, c.film.max_alpha = 0.09, 0.6
+        c.film.max_alpha = 0.6
+        c.film_mult = 0.45                          # keeps the pre-fix film level (0.09 / 3.33); re-tuned later
         c.film.advect_cells_s = 6.0
-        c.splash.rate_per_s, c.splash.satellites_mean = 6.0, 3.0
-        c.splash.r_max_px = (14.0, 32.0)
+        c.splash.impact_prob, c.splash.satellites_mean = 0.06, 3.0
     else:
         raise ValueError(f'unknown scenario {name!r}; choose from {SCENARIOS}')
     return c.validate()

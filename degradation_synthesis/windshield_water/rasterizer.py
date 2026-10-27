@@ -29,6 +29,7 @@ class WaterMaps:
     offset_px: torch.Tensor              # 2 x H x W, (dy, dx) sampling offsets in px
     alpha: torch.Tensor                  # H x W, blend weight (transparency) in [0, 1]
     layers: Dict[str, torch.Tensor] = field(default_factory=dict)   # per-layer alpha (H x W)
+    layer_heights: Dict[str, torch.Tensor] = field(default_factory=dict)   # per-layer height (H x W)
 
     def drop_model_inputs(self):
         """(v 1xHxWx3, mask 1xHxWx1) in DropModel.apply_drops' convention:

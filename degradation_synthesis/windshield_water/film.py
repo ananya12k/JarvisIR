@@ -4,9 +4,12 @@ Water film F(x, y, t) in [0, 1] on a coarse grid.
     F_{t+dt} = clamp(F_t + dt S_t - dt L_t + dt div(D grad F_t), 0, 1)
     optional directional transport:  dF/dt + div(F u) = S - L,  u = (0, advect * F)
 
-S = source * R^gamma / mean(R^gamma) (+ splash residue, rivulet overflow), L = loss * F,
-so without transport the film settles at F ~ S / L: patchy where the rain field is
-dense (gamma > 1 sharpens that), never a uniform layer. Diffusion is explicit with sub-steps so that
+S = s0 G(I) m R^gamma / mean(R^gamma) + (splash residue, rivulet overflow), L = loss F.
+The spatial factor R^gamma / mean(R^gamma) only says WHERE rain is denser (gamma > 1
+sharpens patches); the global intensity I enters separately through G(I) = I^kappa
+(a uniform multiplier inside the normalised term would cancel). Residue / overflow
+arrive as water volume (converted with depth_px) and are added once, not scaled by I.
+Without transport the film settles at F ~ S / L: patchy, never a uniform layer. Diffusion is explicit with sub-steps so that
 D dt_sub / dx^2 <= 0.2 (stable); transport is semi-Lagrangian (stable).
 """
 
@@ -30,22 +33,39 @@ class FilmField:
         return min(max(int(y / self.g), 0), self.gh - 1), min(max(int(x / self.g), 0), self.gw - 1)
 
     def add(self, x, y, amount, radius_px):
-        """Deposit film locally (splash residue etc.); applied in the next update."""
+        """Raise the film level by `amount` over a disc (applied in the next update)."""
         cy, cx = self.cell(x, y)
         rr = max(1, int(round(radius_px / self.g)))
         splat = np.zeros_like(self.F)
         cv2.circle(splat, (cx, cy), rr, 1.0, -1)
         self._extra += splat * amount
 
+    def add_volume(self, x, y, volume, radius_px):
+        """Deposit a water VOLUME over a disc: level = volume / (area_px * depth_px)."""
+        cy, cx = self.cell(x, y)
+        rr = max(1, int(round(radius_px / self.g)))
+        splat = np.zeros_like(self.F)
+        cv2.circle(splat, (cx, cy), rr, 1.0, -1)
+        area_px = max(float(splat.sum()), 1.0) * self.g ** 2
+        self._extra += splat * (volume / (area_px * self.cfg.film.depth_px))
+
+    def source(self, rain_grid, intensity):
+        """S_rain = s0 G(I) m R^gamma / mean(R^gamma)  (per second)."""
+        fc = self.cfg.film
+        Rg = np.power(np.maximum(rain_grid, 0), fc.rain_exponent)
+        G = max(intensity, 0.0) ** fc.intensity_exponent
+        return fc.source_per_s * G * self.cfg.film_mult * Rg / max(float(Rg.mean()), 1e-6)
+
     @staticmethod
     def laplacian(F):
         P = np.pad(F, 1, mode='edge')                  # no-flux borders
         return P[:-2, 1:-1] + P[2:, 1:-1] + P[1:-1, :-2] + P[1:-1, 2:] - 4 * F
 
-    def update(self, dt, rain_grid, overflow=None):
+    def update(self, dt, rain_grid, intensity=1.0, overflow=None):
+        """rain_grid: spatial pattern R (not scaled by intensity); intensity: global I;
+        overflow: film-level increment this step (added once)."""
         fc = self.cfg.film
-        Rg = np.power(np.maximum(rain_grid, 0), fc.rain_exponent)
-        S = fc.source_per_s * Rg / max(float(Rg.mean()), 1e-6) + self._extra / dt
+        S = self.source(rain_grid, intensity) + self._extra / dt
         if overflow is not None:
             S = S + overflow / dt
         self._extra[:] = 0
@@ -64,6 +84,9 @@ class FilmField:
             self.F = cv2.remap(self.F.astype(np.float32), self._gx, self._gy - v, cv2.INTER_LINEAR,
                                borderMode=cv2.BORDER_CONSTANT, borderValue=0)
         self.F = np.clip(self.F, 0.0, 1.0).astype(np.float32)
+
+    def level_at(self, x, y) -> float:
+        return float(self.F[self.cell(x, y)])
 
     def coverage(self) -> float:
         return float((self.F > self.cfg.film.visible).mean())
