@@ -156,9 +156,9 @@ class SplashConfig:
     satellites_mean: float = 1.5                   # x strength
     satellite_r_px: Tuple[float, float] = (1.8, 3.5)
     residual_drop_frac: float = 0.6                # remaining budget -> droplet; the rest -> film
-    height: float = 6.0                            # px at radius_ref, x (R_max / R_ref)^exp, capped
+    height: float = 3.5                            # px at radius_ref, x (R_max / R_ref)^exp, capped
     height_size_exp: float = 1.0
-    height_cap: float = 1.5                        # x height: at most 9 px
+    height_cap: float = 1.5                        # x height: at most ~5 px
     crown: float = 0.9                             # raised rim: profile ~ 0.35 + crown rho^3
     alpha: float = 0.85
     ambient_rate_per_s: float = 0.0                # optional independent events (off: impacts drive splashes)
@@ -174,12 +174,12 @@ class RenderConfig:
     composition: str = 'layered'                   # 'layered' (see simulator.compose) | 'max' (old baseline)
     # shading: water on glass is seen through light - a highlight on slopes facing the
     # light and a dark meniscus rim where the surface is steep (0 disables)
-    specular: float = 0.7                          # highlight strength (fraction of white)
+    specular: float = 0.0                          # highlight strength (off: looked synthetic / cartoon-like)
     shininess: float = 30.0                        # Blinn-Phong exponent
     light_dir: Tuple[float, float, float] = (-0.35, -0.55, 0.76)   # (x right, y down, z to camera)
-    rim_dark: float = 0.4                          # darkening at steep edges
+    rim_dark: float = 0.0                          # dark-rim outline (off: looked synthetic)
     rim_gain: float = 3.0                          # rim = clip(gain (1 - n_z), 0, 1)
-    sheen: Tuple[Tuple[str, float], ...] = (('splashes', 0.25), ('film', 0.05))   # sky reflection per layer
+    sheen: Tuple[Tuple[str, float], ...] = (('splashes', 0.12),)   # subtle lighter wet smear on fresh splashes only
     thin_cap_px: float = 4.0                       # cap of the combined thin-water height (layered)
 
 

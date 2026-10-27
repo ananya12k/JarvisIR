@@ -39,7 +39,7 @@ class WaterRenderer:
            sheen     = per-layer sky reflection (splash sheets, film)
            highlight = max(0, (n.h)^s - h_z^s)   Blinn-Phong, flat-glass baseline removed
            rim       = clip(gain (1 - n_z), 0, 1) steep edges -> dark meniscus"""
-        if rc.specular <= 0 and rc.rim_dark <= 0:
+        if rc.specular <= 0 and rc.rim_dark <= 0 and not any(k > 0 for _, k in rc.sheen):
             return img
         n = maps.normal                                          # (n_x, n_y, n_z)
         l = torch.tensor(rc.light_dir, device=n.device, dtype=n.dtype)
