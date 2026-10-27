@@ -156,10 +156,11 @@ class SplashConfig:
     satellites_mean: float = 1.5                   # x strength
     satellite_r_px: Tuple[float, float] = (1.8, 3.5)
     residual_drop_frac: float = 0.6                # remaining budget -> droplet; the rest -> film
-    height: float = 2.0                            # px at radius_ref, x (R_max / R_ref)^exp, capped
+    height: float = 6.0                            # px at radius_ref, x (R_max / R_ref)^exp, capped
     height_size_exp: float = 1.0
-    height_cap: float = 1.5                        # x height: at most 3 px
-    alpha: float = 0.7
+    height_cap: float = 1.5                        # x height: at most 9 px
+    crown: float = 0.9                             # raised rim: profile ~ 0.35 + crown rho^3
+    alpha: float = 0.85
     ambient_rate_per_s: float = 0.0                # optional independent events (off: impacts drive splashes)
     ambient_water_per_px2: float = 0.6
 
@@ -171,6 +172,14 @@ class RenderConfig:
     max_patch: int = 161
     patch_buckets: Tuple[int, ...] = (25, 41, 65, 97, 129)
     composition: str = 'layered'                   # 'layered' (see simulator.compose) | 'max' (old baseline)
+    # shading: water on glass is seen through light - a highlight on slopes facing the
+    # light and a dark meniscus rim where the surface is steep (0 disables)
+    specular: float = 0.7                          # highlight strength (fraction of white)
+    shininess: float = 30.0                        # Blinn-Phong exponent
+    light_dir: Tuple[float, float, float] = (-0.35, -0.55, 0.76)   # (x right, y down, z to camera)
+    rim_dark: float = 0.4                          # darkening at steep edges
+    rim_gain: float = 3.0                          # rim = clip(gain (1 - n_z), 0, 1)
+    sheen: Tuple[Tuple[str, float], ...] = (('splashes', 0.25), ('film', 0.05))   # sky reflection per layer
     thin_cap_px: float = 4.0                       # cap of the combined thin-water height (layered)
 
 
@@ -237,7 +246,7 @@ def preset(name: str) -> SimConfig:
         # mostly stationary small beads, occasional big ones, few sliders, rare splashes;
         # growth / evaporation balance radius g / e = 1.2 px < r_min: beads slowly
         # evaporate instead of piling up
-        c.warmup_s = 30.0
+        c.warmup_s = 40.0                           # drop count settles in ~40 s (measured over 3 min)
         c.intensity = 30 / 90
         c.spawn.size_mixture = [SizeComponent(0.90, 4.0, 0.45), SizeComponent(0.10, 10.0, 0.30)]
         c.growth.g_max, c.growth.evaporation_per_s = 0.18, 0.15

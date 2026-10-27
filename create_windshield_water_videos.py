@@ -139,7 +139,7 @@ def run_clip(split, seq, args, gpu, munit):
             sim.step()
             maps = sim.render_maps()
             with torch.no_grad():
-                out = renderer.apply_maps(wet, maps, sigma=args.sigma)
+                out = renderer.apply_maps(wet, maps, sigma=args.sigma, cfg=sim.cfg)
             torch.cuda.synchronize(device)
             recs[sc].record(sim, maps, step_ms=1000 * (time.perf_counter() - t0))
             flick[sc].update(out)
@@ -157,7 +157,7 @@ def run_clip(split, seq, args, gpu, munit):
         wr['grid'].write(grid(tiles[:6], 3))
         if integ_sim is not None:
             with torch.no_grad():
-                water_only = renderer.apply_maps(x, integ_sim.last_maps, sigma=args.sigma)
+                water_only = renderer.apply_maps(x, integ_sim.last_maps, sigma=args.sigma, cfg=integ_sim.cfg)
             it = [label(cv2.resize(gt_bgr, (pw, ph)), '1. original'),
                   label(cv2.resize(to_bgr(wet[0]), (pw, ph)), '2. MUNIT only'),
                   label(cv2.resize(to_bgr(water_only[0]), (pw, ph)), '3. water only (steady)'),

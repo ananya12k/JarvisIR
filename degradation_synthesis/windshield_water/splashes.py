@@ -189,7 +189,9 @@ class SplashSystem:
             phi = np.arctan2(dy, dx)
             rho = np.hypot(dx, dy) / np.maximum(ev.boundary(phi, sc.tau_s, sc.relax_s, sc.finger_amp), 1e-3)
             inside = np.clip(1 - rho ** 4, 0, 1)
-            rim = 0.6 + 0.4 * np.clip(rho, 0, 1)                                 # thicker rim than centre
+            # crown: the rim stands higher than the thin centre, so both flanks of the
+            # rim catch light (highlight) and are steep (dark meniscus) -> visible splash
+            rim = 0.35 + sc.crown * np.clip(rho, 0, 1) ** 3
             f = ev.fade(dt)
             hv = (self.peak_height(ev) * f * inside * rim).astype(np.float32)
             # graded opacity (thin at the edge, like the height): as the event fades its

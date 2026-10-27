@@ -467,3 +467,22 @@ def test_isolated_drop_is_identical_under_both_compositions():
         d.opacity = 1.0
         out.append(sim.render_maps())
     assert torch.allclose(out[0].height, out[1].height) and torch.allclose(out[0].alpha, out[1].alpha)
+
+
+def test_shading_touches_only_water_and_makes_splashes_visible():
+    from windshield_water.renderer import WaterRenderer
+    cfg = quiet(splash={'enabled': True}, film={'enabled': True, 'source_per_s': 0.0})
+    sim = sim_with(cfg)
+    sim.splashes.trigger(sim.rng, 160.0, 120.0, 11.0 ** 3, 1.3, 0.6 * 11.0 ** 3)
+    for _ in range(4):
+        sim.step()
+    m = sim.render_maps()
+    ren = WaterRenderer(H, W, device=DEV)
+    frame = torch.full((1, 3, H, W), -0.2, device=DEV)                 # flat grey: refraction alone shows nothing
+    plain = ren.apply_maps(frame, m, sigma=3.0)
+    shaded = ren.apply_maps(frame, m, sigma=3.0, cfg=sim.cfg)
+    near = torch.nn.functional.max_pool2d((m.alpha > 0).float()[None, None], 21, stride=1, padding=10)[0, 0]
+    dry = near == 0
+    assert torch.equal(shaded[0][:, dry], plain[0][:, dry])            # dry glass untouched
+    wet = m.layers['splashes'] > 0.3
+    assert (shaded[0][:, wet] - plain[0][:, wet]).abs().mean() > 0.05   # the splash shows up
