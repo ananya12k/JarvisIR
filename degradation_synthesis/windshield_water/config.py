@@ -237,6 +237,9 @@ def preset(name: str) -> SimConfig:
         c.growth.g_max = 0.9
         c.motion.slide_radius_px, c.motion.v_max_px_s = 12.0, 180.0
         c.trails.decay_per_s, c.trails.width_frac = 1.0, 0.45
+        # rivulets need ~15 s to reach their steady state: longer warm-up, so clips don't
+        # start below equilibrium (measured over 60 s, 3 seeds)
+        c.warmup_s = 20.0
         c.rivulets.enabled = True
         c.rivulets.deposit_gain, c.rivulets.decay_per_s, c.rivulets.threshold = 0.4, 0.3, 0.45
         c.film.enabled = True
@@ -250,6 +253,7 @@ def preset(name: str) -> SimConfig:
         c.growth.g_max = 1.2
         c.motion.slide_radius_px, c.motion.v_max_px_s = 11.0, 210.0
         c.trails.decay_per_s, c.trails.width_frac = 1.1, 0.5
+        c.warmup_s = 20.0                          # see heavy
         c.rivulets.enabled = True
         c.rivulets.threshold, c.rivulets.flow_px_s = 0.4, 80.0
         c.rivulets.deposit_gain, c.rivulets.decay_per_s = 0.6, 0.25
