@@ -288,6 +288,7 @@ class PhysicalFogEngine:
 
         beta_t = self.beta_base * hetero * (0.4 + 1.2 * psi)
         beta_field = beta_t * (self.beta_base / (float(np.mean(beta_t)) + 1e-12))
+        self.last_beta_field = beta_field                 # for visualisation only
 
         t = np.exp(-beta_field * d).astype(np.float32)
         m = 1.0 - t
