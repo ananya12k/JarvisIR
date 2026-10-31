@@ -35,6 +35,12 @@ def depth_tile(depth, max_depth_m):
     return cv2.applyColorMap((255 * (1.0 - d)).astype(np.uint8), cv2.COLORMAP_INFERNO)
 
 
+def beta_tile(beta_field, beta_base):
+    # Local extinction relative to the frame mean (1.0 = beta_base); 0.4x .. 1.6x.
+    r = np.clip((beta_field / beta_base - 0.4) / 1.2, 0, 1)
+    return cv2.applyColorMap((255 * r).astype(np.uint8), cv2.COLORMAP_VIRIDIS)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--input", default="/scratch/Ananya_Kulkarni/Defog_Dataset/test/GT/03")
@@ -50,6 +56,8 @@ def main():
     p.add_argument("--vda_root", default="/scratch/Ananya_Kulkarni/Video-Depth-Anything")
     p.add_argument("--encoder", default="vits", choices=["vits", "vitb", "vitl"])
     p.add_argument("--gpu_id", type=int, default=0)
+    p.add_argument("--extra_tile", default="depth", choices=["depth", "beta"],
+                   help="8th tile: VDA depth, or the 50 m engine's local extinction field")
     p.add_argument("--crf", type=int, default=18)
     args = p.parse_args()
 
@@ -87,7 +95,12 @@ def main():
         tiles = [label(frame, "clean")]
         for m, eng in zip(mors, engines):
             tiles.append(label(eng.apply_fog(frame, depth), f"MOR {m:.0f} m   beta {3.0 / m:.3f}"))
-        tiles.append(label(depth_tile(depth, engines[0].max_depth_m), "VDA depth (0-120 m)"))
+        if args.extra_tile == "beta":
+            eng = engines[-1]
+            tiles.append(label(beta_tile(eng.last_beta_field, eng.beta_base),
+                               f"local beta / beta0 (0.4-1.6x), {args.heterogeneity}"))
+        else:
+            tiles.append(label(depth_tile(depth, engines[0].max_depth_m), "VDA depth (0-120 m)"))
         grid = np.vstack([np.hstack(tiles[0:4]), np.hstack(tiles[4:8])])[:H, :W]
         ffmpeg.stdin.write(np.ascontiguousarray(grid).tobytes())
 
