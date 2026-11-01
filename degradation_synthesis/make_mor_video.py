@@ -51,7 +51,7 @@ def main():
     p.add_argument("--mor_ladder", default="300,200,150,100,75,50")
     p.add_argument("--airlight", type=float, default=0.72)
     p.add_argument("--fog_layer_m", type=float, default=20.0)
-    p.add_argument("--heterogeneity", default="uniform", choices=["uniform", "patchy"])
+    p.add_argument("--heterogeneity", default="uniform", choices=["uniform", "patchy", "patchy_strong"])
     p.add_argument("--fbm_seed", type=int, default=12345)
     p.add_argument("--vda_root", default="/scratch/Ananya_Kulkarni/Video-Depth-Anything")
     p.add_argument("--encoder", default="vits", choices=["vits", "vitb", "vitl"])
