@@ -6,12 +6,12 @@ VISIA_old/build_diverse_mor_edfog.sh; output layout and manifest columns match
 what regen_from_manifest.py / regen_ladder.py / video_dataset.py consume.
 
 Two ways to get per-clip parameters:
-  sample (default)   balanced MOR ladder {50,75,100,150,200,300} m, repeated and
-                     deterministically shuffled across the split's (scene,config)
-                     pairs; airlight / fog layer / heterogeneity / fbm_seed drawn
-                     from SHA-256(global_seed|scene|config). The seed deliberately
-                     excludes the split (the shipped manifest shows train/GH019009
-                     and val/GH019009 sharing fbm_seeds per config).
+  sample (default)   stratified per split: the MOR ladder, airlight levels,
+                     fog-layer heights and heterogeneity modes are each spread as
+                     evenly as possible over the split's (scene,config) pairs, so
+                     val and test contain every fog variant that train does; no
+                     MOR repeats within a scene. fbm_seed = SHA-256(global_seed|
+                     scene|config).
   --from_manifest    replay an existing manifest.csv row-for-row (e.g. the
                      recovered train/val rows of the shipped EDFog).
 
@@ -82,34 +82,76 @@ def parse_mix(spec):
     return [(name, p / total) for name, p in mix]
 
 
-def pick_heterogeneity(u, mix):
-    acc = 0.0
-    for name, p in mix:
-        acc += p
-        if u < acc:
-            return name
-    return mix[-1][0]
+def balanced(levels, n, rng):
+    """n values covering every level as evenly as possible (counts differ by <= 1), shuffled."""
+    reps = -(-n // len(levels))
+    return list(rng.permutation(np.concatenate([rng.permutation(levels) for _ in range(reps)])[:n]))
+
+
+def mix_counts(mix, n):
+    """Clip count per heterogeneity mode: proportional to p, but >= 1 for every mode with
+    p > 0 whenever the split has enough clips, so each split contains every fog type."""
+    counts = {name: int(round(p * n)) for name, p in mix}
+    if n >= len(mix):
+        for name, p in mix:
+            if p > 0 and counts[name] == 0:
+                counts[name] = 1
+    while sum(counts.values()) > n:
+        counts[max(counts, key=counts.get)] -= 1
+    while sum(counts.values()) < n:
+        counts[max(mix, key=lambda m: m[1])[0]] += 1
+    return counts
+
+
+def assign_mors(tasks, ladder, rng):
+    """Balanced MOR ladder over the split (each level an equal share, +-1) with no MOR
+    repeated within a scene when the scene has <= len(ladder) configs."""
+    pool = {m: c for m, c in zip(*np.unique(balanced(ladder, len(tasks), rng), return_counts=True))}
+    by_scene = {}
+    for scene, cfg in tasks:
+        by_scene.setdefault(scene, []).append(cfg)
+    out = {}
+    for scene in rng.permutation(sorted(by_scene)):
+        used = set()
+        for cfg in by_scene[scene]:
+            cands = [m for m, c in pool.items() if c > 0 and m not in used] or [m for m, c in pool.items() if c > 0]
+            top = max(pool[m] for m in cands)
+            m = rng.choice(sorted(m for m in cands if pool[m] == top))
+            pool[m] -= 1
+            used.add(m)
+            out[(scene, cfg)] = float(m)
+    return out
 
 
 def sample_plan(scenes_by_split, n_cfg, mor_ladder, global_seed, fps, mix):
+    """
+    Stratified, per split: every split (train, val AND test) covers every MOR level,
+    every heterogeneity mode, every airlight level and every fog-layer height as
+    evenly as its clip count allows, instead of i.i.d. draws that can leave a level
+    out of a small eval split. Deterministic from global_seed; fbm_seed stays a
+    SHA-256 function of (scene, config).
+    """
     rows = []
     for split, scenes in scenes_by_split.items():
         tasks = [(scene, cfg) for scene in sorted(scenes) for cfg in range(n_cfg[split])]
         if not tasks:
             continue
-        reps = -(-len(tasks) // len(mor_ladder))
-        mors = np.array(list(mor_ladder) * reps)[:len(tasks)]
-        mors = np.random.default_rng(stable_seed(global_seed, "mor_ladder", split)).permutation(mors)
-        for (scene, cfg), mor in zip(tasks, mors):
-            rng = np.random.default_rng(stable_seed(global_seed, scene, cfg))
-            a = float(rng.choice(AIRLIGHT_LEVELS))
+        n = len(tasks)
+        rng = np.random.default_rng(stable_seed(global_seed, "plan", split))
+        mors = assign_mors(tasks, list(mor_ladder), rng)
+        airlights = balanced(list(AIRLIGHT_LEVELS), n, rng)
+        layers = balanced(list(FOG_LAYER_LEVELS_M), n, rng)
+        hets = list(rng.permutation([name for name, c in mix_counts(mix, n).items() for _ in range(c)]))
+        for i, (scene, cfg) in enumerate(tasks):
+            mor = mors[(scene, cfg)]
+            a = float(airlights[i])
             rows.append(dict(
                 split=split, scene=scene, config_idx=cfg,
-                beta_base=round(3.0 / float(mor), 6), mor=float(mor),
+                beta_base=round(3.0 / mor, 6), mor=mor,
                 airlight_color=str([a, a, a]),
-                fog_layer_m=float(rng.choice(FOG_LAYER_LEVELS_M)),
-                heterogeneity=pick_heterogeneity(rng.random(), mix),
-                fbm_seed=int(rng.integers(0, 2**32)),
+                fog_layer_m=float(layers[i]),
+                heterogeneity=str(hets[i]),
+                fbm_seed=int(np.random.default_rng(stable_seed(global_seed, scene, cfg)).integers(0, 2**32)),
                 speed_kmh=0.0, fps=fps,
             ))
     return rows

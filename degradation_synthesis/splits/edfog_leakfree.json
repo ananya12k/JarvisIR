@@ -1,0 +1,9 @@
+{
+  "description": "Leak-free split of Defog_Dataset. Scenes 00-09 are one continuous recording; test keeps 03 and 09 (as in the shipped EDFog), val takes the start of the chain (00, 01) plus the independent GoPro recording GH019005. GH019007/08/09 are consecutive GoPro recordings and stay together in train. leakfree_split.py removes a buffer from the train side at every continuous train|eval boundary (01|02, 02|03, 03|04, 08|09).",
+  "assignment": {
+    "00": "val", "01": "val", "GH019005": "val",
+    "03": "test", "09": "test",
+    "02": "train", "04": "train", "05": "train", "06": "train", "07": "train", "08": "train",
+    "GH019007": "train", "GH019008": "train", "GH019009": "train", "GH019014": "train"
+  }
+}
