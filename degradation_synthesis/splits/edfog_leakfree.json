@@ -1,9 +1,16 @@
 {
-  "description": "Leak-free split of Defog_Dataset. Scenes 00-09 are one continuous recording; test keeps 03 and 09 (as in the shipped EDFog), val takes the start of the chain (00, 01) plus the independent GoPro recording GH019005. GH019007/08/09 are consecutive GoPro recordings and stay together in train. leakfree_split.py removes a buffer from the train side at every continuous train|eval boundary (01|02, 02|03, 03|04, 08|09).",
+  "description": "Leak-free 70:20:10 (train:val:test, by clean frames) split of Defog_Dataset. Scenes 00-09 are ONE continuous recording: val takes its start (00, 01), test its end (09), train the middle (03-07); one whole scene on each side of train is excluded as a buffer (02 ~75 s, 08 ~75 s), above the 60 s at which ORB+RANSAC place matching across a cut falls to the unrelated-place level. GH019005 (independent GoPro recording) goes to test and the first part of GH019014 to val, so both eval sets contain both cameras; the rest of GH019014 is train, with the 60 s buffer cut automatically between the two parts. GH019007/08/09 are back-to-back GoPro recordings and stay in train. GH019007 drives past the location of val scene 00 again (same buildings/markings; matches around GH019007 frames 6806-8816), so only its frames [0, 5005) are kept.",
   "assignment": {
-    "00": "val", "01": "val", "GH019005": "val",
-    "03": "test", "09": "test",
-    "02": "train", "04": "train", "05": "train", "06": "train", "07": "train", "08": "train",
-    "GH019007": "train", "GH019008": "train", "GH019009": "train", "GH019014": "train"
-  }
+    "00": "val", "01": "val",
+    "02": "exclude",
+    "03": "train", "04": "train", "05": "train", "06": "train", "07": "train",
+    "08": "exclude",
+    "09": "test", "GH019005": "test",
+    "GH019007": "train", "GH019008": "train", "GH019009": "train",
+    "GH019014": [
+      {"name": "GH019014p1", "split": "val",   "frames": [0, 3902]},
+      {"name": "GH019014p2", "split": "train", "frames": [3902, 7688]}
+    ]
+  },
+  "keep_frames": {"GH019007": [0, 5005]}
 }

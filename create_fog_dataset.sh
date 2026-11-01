@@ -15,12 +15,13 @@
 #   [0] leak-free split: SPLIT_JSON assigns scenes to splits; continuity between
 #       scenes is detected from the frames and a BUFFER_S buffer is cut at every
 #       continuous train|eval boundary; the job ABORTS on any leak (shared scene,
-#       unbuffered boundary, cross-split near-duplicate frame)
-#   [1] fog: stratified per split, so val and test contain every fog variant
-#       train does (all MOR levels, uniform+patchy, all airlights, all fog
-#       layers); MOR ladder 300 200 150 100 75 50 m (paper) + 30 20 m
-#         train 4 configs/scene | val 3/scene (all 8 MORs) | test 8/scene (every
-#         MOR on every test scene)
+#       unbuffered boundary, cross-split near-duplicate frame, or the same place
+#       seen in two splits by ORB+RANSAC feature matching)
+#   [1] fog: EVERY scene of every split is rendered at EVERY MOR level of the
+#       ladder (300 200 150 100 75 50 m from the paper + 30 20 m), so no scene is
+#       tied to particular fog levels and train/val/test have the same uniform
+#       design; airlight, fog-layer height and uniform/patchy (p=0.1) are spread
+#       evenly over each split's clips
 #   [2] semantic masks
 #   [3] leak re-check of the finished dataset
 #
@@ -50,13 +51,14 @@ PY="${PY:-$HOME/miniconda3/envs/visia/bin/python}"
 JARVIS=/scratch/Ananya_Kulkarni/JarvisIR/degradation_synthesis
 SOURCE="${SOURCE:-/scratch/Ananya_Kulkarni/Defog_Dataset}"     # <split>/GT/<scene>/<frames>
 SPLIT_JSON="${SPLIT_JSON:-$JARVIS/splits/edfog_leakfree.json}"
-BUFFER_S="${BUFFER_S:-15}"
+BUFFER_S="${BUFFER_S:-60}"
 OUT="${OUT:-/scratch/Ananya_Kulkarni/Defog_fog_8mor}"
 MOR_LADDER="${MOR_LADDER:-300,200,150,100,75,50,30,20}"
 HET_MIX="${HET_MIX:-patchy:0.1,uniform:0.9}"
-TRAIN_CONFIGS="${TRAIN_CONFIGS:-4}"
-VAL_CONFIGS="${VAL_CONFIGS:-3}"
-TEST_CONFIGS="${TEST_CONFIGS:-8}"
+N_MOR=$(echo "$MOR_LADDER" | tr ',' '\n' | wc -l)
+TRAIN_CONFIGS="${TRAIN_CONFIGS:-$N_MOR}"                        # every scene x every MOR level
+VAL_CONFIGS="${VAL_CONFIGS:-$N_MOR}"
+TEST_CONFIGS="${TEST_CONFIGS:-$N_MOR}"
 SEED="${SEED:-edfog-8mor}"
 RESIZE="${RESIZE:-}"                                            # empty = native resolution (paper)
 MAX_FRAMES="${MAX_FRAMES:-0}"                                   # 0 = all frames of every scene
