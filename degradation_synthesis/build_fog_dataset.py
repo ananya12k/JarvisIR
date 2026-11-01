@@ -25,9 +25,10 @@ Output:
 
 Depth is computed ONCE per scene (overlapping VDA sliding window) and every
 config of that scene is rendered from the same depth stream in the same pass.
-Multi-GPU: one process per GPU with --gpu_id/--shard_index/--num_shards (sharded
-by scene). The manifest is a pure function of the arguments, so every shard
-writes the same file.
+Multi-GPU: a single run uses every visible GPU. Scene jobs go into one shared
+queue, longest first, and --jobs_per_gpu workers per GPU each pull the next
+scene when free, so no GPU idles while work remains. (--shard_index/--num_shards
+still split the scene list across separate runs if needed.)
 """
 import argparse
 import csv
@@ -35,6 +36,7 @@ import glob
 import hashlib
 import importlib.util
 import json
+import multiprocessing as mp
 import os
 import shutil
 import sys
@@ -175,7 +177,11 @@ def main():
     p.add_argument("--max_frames", type=int, default=0, help="first N frames per scene; 0 = all")
     p.add_argument("--vda_root", default="/scratch/Ananya_Kulkarni/Video-Depth-Anything")
     p.add_argument("--encoder", default="vits", choices=["vits", "vitb", "vitl"])
-    p.add_argument("--gpu_id", type=int, default=0)
+    p.add_argument("--num_gpus", type=int, default=0, help="0 = all visible GPUs")
+    p.add_argument("--jobs_per_gpu", type=int, default=2,
+                   help="workers per GPU; >1 overlaps one worker's CPU fog maths with another's VDA")
+    p.add_argument("--threads_per_worker", type=int, default=2)
+    p.add_argument("--gpu_id", type=int, default=0, help="GPU to use when --num_gpus 1")
     p.add_argument("--shard_index", type=int, default=0)
     p.add_argument("--num_shards", type=int, default=1)
     p.add_argument("--fps", type=float, default=30.0)
@@ -240,55 +246,104 @@ def main():
     for r in rows:
         by_scene.setdefault((r["split"], r["scene"]), []).append(r)
     scene_keys = sorted(by_scene)[args.shard_index::args.num_shards]
-    if not scene_keys:
+    # Longest first (cost ~ frames x (depth pass + one fog pass per config)), so
+    # short scenes fill the gaps at the end and no worker idles while others run.
+    jobs = [(split, scene, frames_by_scene[(split, scene)], by_scene[(split, scene)])
+            for split, scene in scene_keys]
+    jobs.sort(key=lambda j: -len(j[2]) * (1 + len(j[3])))
+    if not jobs:
         return
 
+    if args.num_gpus == 1:
+        gpus = [args.gpu_id]
+    else:
+        import torch
+        gpus = list(range(args.num_gpus or torch.cuda.device_count())) or [0]
+    slots = [g for g in gpus for _ in range(args.jobs_per_gpu)]
+    print(f"[queue] {len(jobs)} scene job(s) | {len(gpus)} GPU(s) x {args.jobs_per_gpu} worker(s)", flush=True)
+
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    for j in jobs:
+        queue.put(j)
+    for _ in slots:
+        queue.put(None)
+    procs = [ctx.Process(target=worker, args=(rank, gpu, queue, args, out_root, resize))
+             for rank, gpu in enumerate(slots)]
+    for pr in procs:
+        pr.start()
+    for pr in procs:
+        pr.join()
+    failed = os.path.join(out_root, "failed_jobs.txt")
+    if os.path.exists(failed):
+        print(f"[queue] some scenes FAILED, see {failed}", flush=True)
+    print("ALL DONE", flush=True)
+
+
+def worker(rank, gpu, queue, args, out_root, resize):
+    """One worker = one VDA instance on `gpu`; pulls scene jobs until the sentinel."""
+    cv2.setNumThreads(args.threads_per_worker)
+    import torch
+    torch.set_num_threads(args.threads_per_worker)
     mod = load_engine(args.engine_file, args.vda_root)
     vda = None
+    tag = f"[GPU {gpu}.{rank}]"
+    while True:
+        job = queue.get()
+        if job is None:
+            return
+        split, scene = job[0], job[1]
+        try:
+            if vda is None:
+                vda = mod.VDAWrapper(encoder=args.encoder, vda_root_path=args.vda_root, device_id=gpu)
+            render_scene(mod, vda, job, args, out_root, resize, tag)
+        except Exception as e:  # keep the other scenes going; report at the end
+            import traceback
+            traceback.print_exc()
+            with open(os.path.join(out_root, "failed_jobs.txt"), "a") as f:
+                f.write(f"{split}/{scene}\t{type(e).__name__}: {e}\n")
 
-    for split, scene in scene_keys:
-        frame_paths = frames_by_scene[(split, scene)]
-        if not frame_paths:
-            print(f"WARNING: no frames for {split}/{scene} at {src_dir[(split, scene)]}", flush=True)
+
+def render_scene(mod, vda, job, args, out_root, resize, tag):
+    split, scene, frame_paths, scene_rows = job
+    if not frame_paths:
+        print(f"WARNING: no frames for {split}/{scene}", flush=True)
+        return
+    frame_paths = materialize_gt(frame_paths, os.path.join(out_root, split, "GT", scene),
+                                 args.copy_gt, resize)
+
+    todo = []
+    for r in scene_rows:
+        if args.skip_existing and len(glob.glob(os.path.join(r["haze_path"], "*.png"))) == len(frame_paths):
+            print(f"{tag} skip {split}/{os.path.basename(r['haze_path'])}", flush=True)
             continue
-        frame_paths = materialize_gt(frame_paths, os.path.join(out_root, split, "GT", scene),
-                                     args.copy_gt, resize)
+        todo.append(r)
+    if not todo:
+        return
 
-        todo = []
-        for r in by_scene[(split, scene)]:
-            if args.skip_existing and len(glob.glob(os.path.join(r["haze_path"], "*.png"))) == len(frame_paths):
-                print(f"[GPU {args.gpu_id}] skip {split}/{os.path.basename(r['haze_path'])}", flush=True)
-                continue
-            todo.append(r)
-        if not todo:
-            continue
+    engines = []
+    for r in todo:
+        os.makedirs(r["haze_path"], exist_ok=True)
+        engines.append(mod.PhysicalFogEngine(
+            beta_base=r["beta_base"], airlight_color=json.loads(r["airlight_color"]),
+            fog_layer_m=r["fog_layer_m"], heterogeneity=r["heterogeneity"],
+            fbm_seed=r["fbm_seed"], speed_kmh=r["speed_kmh"], fps=r["fps"]))
 
-        engines = []
-        for r in todo:
-            os.makedirs(r["haze_path"], exist_ok=True)
-            engines.append(mod.PhysicalFogEngine(
-                beta_base=r["beta_base"], airlight_color=json.loads(r["airlight_color"]),
-                fog_layer_m=r["fog_layer_m"], heterogeneity=r["heterogeneity"],
-                fbm_seed=r["fbm_seed"], speed_kmh=r["speed_kmh"], fps=r["fps"]))
-
-        if vda is None:
-            vda = mod.VDAWrapper(encoder=args.encoder, vda_root_path=args.vda_root, device_id=args.gpu_id)
-        for idx, frame, depth in tqdm(mod.iter_scene_depth(vda, frame_paths, args.vda_batch, args.vda_overlap),
-                                      total=len(frame_paths), desc=f"GPU {args.gpu_id} {split}/{scene} x{len(todo)}"):
-            stem = os.path.splitext(os.path.basename(frame_paths[idx]))[0]
-            for r, eng in zip(todo, engines):
-                cv2.imwrite(os.path.join(r["haze_path"], stem + ".png"), eng.apply_fog(frame, depth))
-
+    for idx, frame, depth in tqdm(mod.iter_scene_depth(vda, frame_paths, args.vda_batch, args.vda_overlap),
+                                  total=len(frame_paths), desc=f"{tag} {split}/{scene} x{len(todo)}",
+                                  mininterval=30):
+        stem = os.path.splitext(os.path.basename(frame_paths[idx]))[0]
         for r, eng in zip(todo, engines):
-            meta = {k: r[k] for k in MANIFEST_FIELDS}
-            meta.update(hurst=eng.hurst, patchiness=eng.patchiness, octaves=eng.octaves,
-                        corr_len_m=eng.corr_len_m, scatter_frac=eng.scatter_frac,
-                        traveled_m=eng.traveled_m, engine_file=os.path.abspath(args.engine_file))
-            with open(os.path.join(r["haze_path"], "meta.json"), "w") as f:
-                json.dump(meta, f, indent=2)
-        print(f"[GPU {args.gpu_id}] done {split}/{scene} ({len(frame_paths)} frames x {len(todo)} configs)", flush=True)
+            cv2.imwrite(os.path.join(r["haze_path"], stem + ".png"), eng.apply_fog(frame, depth))
 
-    print(f"[shard {args.shard_index}/{args.num_shards}] ALL DONE", flush=True)
+    for r, eng in zip(todo, engines):
+        meta = {k: r[k] for k in MANIFEST_FIELDS}
+        meta.update(hurst=eng.hurst, patchiness=eng.patchiness, octaves=eng.octaves,
+                    corr_len_m=eng.corr_len_m, scatter_frac=eng.scatter_frac,
+                    traveled_m=eng.traveled_m, engine_file=os.path.abspath(args.engine_file))
+        with open(os.path.join(r["haze_path"], "meta.json"), "w") as f:
+            json.dump(meta, f, indent=2)
+    print(f"{tag} done {split}/{scene} ({len(frame_paths)} frames x {len(todo)} configs)", flush=True)
 
 
 if __name__ == "__main__":
