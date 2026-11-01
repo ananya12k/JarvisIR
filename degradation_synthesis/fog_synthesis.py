@@ -157,6 +157,12 @@ def value_noise_3d(x, y, z, seed):
 HETEROGENEITY_MODES = {
     'uniform': dict(patchiness=0.03, octaves=2, corr_len_m=100.0),
     'patchy':  dict(patchiness=0.15, octaves=3, corr_len_m=180.0),
+    # NOT in the shipped EDFog / paper. Volumetric patches: extinction is integrated
+    # along each line of sight at fixed sample distances (so the field is anchored by
+    # ego travel alone, independent of VDA depth consistency), with log-normal
+    # density exp(sigma*z - sigma^2/2) where sigma = patchiness and z is the
+    # standardised fBm value (mean density preserved).
+    'patchy_strong': dict(patchiness=0.6, octaves=4, corr_len_m=25.0, volumetric=True),
 }
 
 
@@ -201,6 +207,14 @@ class PhysicalFogEngine:
         self.octave_seeds = rng.integers(0, 2**32, size=self.octaves, dtype=np.uint64)
 
         self.traveled_m = 0.0
+        self.volumetric = bool(mode.get('volumetric', False))
+        self.ray_samples = 16
+        if self.volumetric:
+            # fBm statistics for standardising Phi (deterministic given the seed).
+            pts = rng.uniform(0.0, 50.0, size=(3, 20000)).astype(np.float32) * self.corr_len_m
+            phi = self._fbm_world(pts[0], pts[1], pts[2])
+            self._phi_mu, self._phi_sd = float(phi.mean()), float(phi.std()) + 1e-6
+
         self._depth_scale = None
         self._speed_mpf = 0.0
         self._prev_gray_small = None
@@ -247,6 +261,35 @@ class PhysicalFogEngine:
             norm += a ** i
         return total / norm
 
+    def _volumetric_optical_depth(self, d, f):
+        """
+        tau(p) = int_0^d(p) beta(r(s)) ds along the ray r(s) = s * (x_n, y_n, 1),
+        midpoint rule on `ray_samples` fixed slabs in [0, max_depth_m]. Each slab's
+        density map is independent of depth, so it is evaluated at reduced
+        resolution and upsampled without halos; only the in-slab path length uses
+        the full-res depth. Returns tau / beta_base (relative units).
+        """
+        h, w = d.shape
+        s = self.noise_downsample
+        hs, ws = max(1, h // s), max(1, w // s)
+        xn = (((np.arange(ws, dtype=np.float32) + 0.5) * w / ws) - w / 2.0)[None, :] / f
+        yn = (((np.arange(hs, dtype=np.float32) + 0.5) * h / hs) - h / 2.0)[:, None] / f
+        xn, yn = np.broadcast_to(xn, (hs, ws)), np.broadcast_to(yn, (hs, ws))
+        edges = np.linspace(0.0, self.max_depth_m, self.ray_samples + 1, dtype=np.float32)
+        tau = np.zeros((h, w), dtype=np.float32)
+        for s0, s1 in zip(edges[:-1], edges[1:]):
+            sm = 0.5 * (s0 + s1)
+            Y = yn * sm
+            height = self.cam_height_m - Y
+            psi = np.where(height <= 0.0, 1.0, np.exp(-np.maximum(height, 0.0) / self.fog_layer_m))
+            dens = 0.4 + 1.2 * psi
+            if self.patchiness > 0.0:
+                z = (self._fbm_world(xn * sm, Y, np.full_like(Y, sm)) - self._phi_mu) / self._phi_sd
+                dens = dens * np.exp(self.patchiness * z - 0.5 * self.patchiness ** 2)
+            dens = cv2.resize(dens.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+            tau += dens * np.clip(d - s0, 0.0, s1 - s0)
+        return tau
+
     # -- main ---------------------------------------------------------------
     def apply_fog(self, frame_bgr, depth_meters):
         h, w = frame_bgr.shape[:2]
@@ -274,6 +317,15 @@ class PhysicalFogEngine:
         psi = np.where(height <= 0.0, 1.0,
                        np.exp(-np.maximum(height, 0.0) / self.fog_layer_m)).astype(np.float32)
 
+        if self.volumetric:
+            # Same per-frame stratification normalisation as the surface model,
+            # so a given MOR carries the same average fog amount in every mode.
+            norm = self.beta_base / float(np.mean(0.4 + 1.2 * psi))
+            tau = norm * self._volumetric_optical_depth(d, f)
+            self.last_beta_field = tau / np.maximum(d, 1e-3)    # path-averaged, for visualisation
+            t = np.exp(-tau).astype(np.float32)
+            return self._composite(J, t, psi)
+
         # Heterogeneity (world-anchored fBm). The field is smooth on the scale of
         # the correlation length, so it is evaluated at reduced resolution.
         if self.patchiness > 0.0:
@@ -291,6 +343,9 @@ class PhysicalFogEngine:
         self.last_beta_field = beta_field                 # for visualisation only
 
         t = np.exp(-beta_field * d).astype(np.float32)
+        return self._composite(J, t, psi)
+
+    def _composite(self, J, t, psi):
         m = 1.0 - t
 
         # Forward scatter: depth-dependent APSF from two Gaussian scales.
