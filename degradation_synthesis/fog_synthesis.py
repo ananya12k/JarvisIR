@@ -303,7 +303,10 @@ class PhysicalFogEngine:
         s_air = m3 - s_sc
         I = J * t[..., None] + G * s_sc + A_eff * s_air
 
-        return np.clip(np.rint(I * 255.0), 0, 255).astype(np.uint8)
+        # Truncating quantisation, like the original engine (measured against its
+        # surviving output: rounding gave a uniform +0.5 grey-level bias). The tiny
+        # epsilon keeps t == 1 pixels bit-identical despite float32 J*255 error.
+        return np.clip(np.floor(I * 255.0 + 1e-3), 0, 255).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
