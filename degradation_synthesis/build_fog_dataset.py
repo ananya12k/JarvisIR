@@ -48,7 +48,7 @@ MANIFEST_FIELDS = ["split", "scene", "config_idx", "beta_base", "mor", "airlight
                    "n_frames", "gt_path", "haze_path"]
 AIRLIGHT_LEVELS = (0.64, 0.72, 0.82)
 FOG_LAYER_LEVELS_M = (8.0, 20.0, 40.0)
-P_PATCHY = 0.1
+DEFAULT_HETEROGENEITY_MIX = "patchy:0.1,uniform:0.9"      # paper: patchy p=0.1
 
 
 def stable_seed(*parts):
@@ -74,7 +74,22 @@ def clip_name(scene, cfg, beta):
     return f"{scene}_cfg{cfg}_beta{beta:.4f}"
 
 
-def sample_plan(scenes_by_split, n_cfg, mor_ladder, global_seed, fps):
+def parse_mix(spec):
+    mix = [(name.strip(), float(p)) for name, p in (item.split(":") for item in spec.split(",") if item.strip())]
+    total = sum(p for _, p in mix)
+    return [(name, p / total) for name, p in mix]
+
+
+def pick_heterogeneity(u, mix):
+    acc = 0.0
+    for name, p in mix:
+        acc += p
+        if u < acc:
+            return name
+    return mix[-1][0]
+
+
+def sample_plan(scenes_by_split, n_cfg, mor_ladder, global_seed, fps, mix):
     rows = []
     for split, scenes in scenes_by_split.items():
         tasks = [(scene, cfg) for scene in sorted(scenes) for cfg in range(n_cfg[split])]
@@ -91,7 +106,7 @@ def sample_plan(scenes_by_split, n_cfg, mor_ladder, global_seed, fps):
                 beta_base=round(3.0 / float(mor), 6), mor=float(mor),
                 airlight_color=str([a, a, a]),
                 fog_layer_m=float(rng.choice(FOG_LAYER_LEVELS_M)),
-                heterogeneity="patchy" if rng.random() < P_PATCHY else "uniform",
+                heterogeneity=pick_heterogeneity(rng.random(), mix),
                 fbm_seed=int(rng.integers(0, 2**32)),
                 speed_kmh=0.0, fps=fps,
             ))
@@ -109,20 +124,29 @@ def manifest_plan(path, splits):
     return rows
 
 
-def materialize_gt(frame_paths, dst_dir, copy):
+def materialize_gt(frame_paths, dst_dir, copy, resize=None):
+    """Writes the clean reference; returns the frame paths rendering should read."""
     os.makedirs(dst_dir, exist_ok=True)
+    out = []
     for p in frame_paths:
-        dst = os.path.join(dst_dir, os.path.basename(p))
-        if os.path.lexists(dst):
+        if resize:
+            dst = os.path.join(dst_dir, os.path.splitext(os.path.basename(p))[0] + ".png")
+            if not os.path.exists(dst):
+                cv2.imwrite(dst, cv2.resize(cv2.imread(p), resize, interpolation=cv2.INTER_AREA))
+            out.append(dst)
             continue
-        if copy:
-            shutil.copy2(p, dst)
-        else:
-            os.symlink(os.path.abspath(p), dst)
+        dst = os.path.join(dst_dir, os.path.basename(p))
+        if not os.path.lexists(dst):
+            if copy:
+                shutil.copy2(p, dst)
+            else:
+                os.symlink(os.path.abspath(p), dst)
+        out.append(p)
+    return out
 
 
-def write_manifest(rows, out_root):
-    path = os.path.join(out_root, "manifest.csv")
+def write_manifest(rows, out_root, name="manifest.csv"):
+    path = os.path.join(out_root, name)
     tmp = f"{path}.tmp{os.getpid()}"
     with open(tmp, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=MANIFEST_FIELDS, extrasaction="ignore")
@@ -141,7 +165,11 @@ def main():
     p.add_argument("--from_manifest", default=None, help="replay this manifest instead of sampling")
     p.add_argument("--n_configs_train", type=int, default=4)
     p.add_argument("--n_configs_eval", type=int, default=2)
+    p.add_argument("--n_configs_test", type=int, default=None, help="default: --n_configs_eval")
     p.add_argument("--mor_ladder", default="50,75,100,150,200,300")
+    p.add_argument("--heterogeneity_mix", default=DEFAULT_HETEROGENEITY_MIX,
+                   help="e.g. 'uniform:0.4,patchy_strong:0.6'")
+    p.add_argument("--resize", default="", help="WxH, e.g. 480x270 (the shipped EDFog size); default native")
     p.add_argument("--global_seed", default="edfog")
     p.add_argument("--scenes", default="", help="comma list restricting scenes (all splits)")
     p.add_argument("--max_frames", type=int, default=0, help="first N frames per scene; 0 = all")
@@ -155,10 +183,12 @@ def main():
     p.add_argument("--vda_overlap", type=int, default=2)
     p.add_argument("--copy_gt", action="store_true", help="copy GT frames instead of symlinking")
     p.add_argument("--skip_existing", action="store_true")
+    p.add_argument("--manifest_name", default="manifest.csv")
     p.add_argument("--plan_only", action="store_true", help="write manifest.csv and exit")
     args = p.parse_args()
 
     out_root = os.path.abspath(args.out_root)
+    resize = tuple(int(v) for v in args.resize.lower().split("x")) if args.resize else None
     split_roots = {s: os.path.abspath(r) for s, r in
                    (("train", args.train_root), ("val", args.val_root), ("test", args.test_root)) if r}
     scene_filter = {s.strip() for s in args.scenes.split(",") if s.strip()}
@@ -177,9 +207,11 @@ def main():
         for split, root in split_roots.items():
             scenes = sorted(d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d)))
             scenes_by_split[split] = [s for s in scenes if not scene_filter or s in scene_filter]
-        n_cfg = {"train": args.n_configs_train, "val": args.n_configs_eval, "test": args.n_configs_eval}
+        n_test = args.n_configs_eval if args.n_configs_test is None else args.n_configs_test
+        n_cfg = {"train": args.n_configs_train, "val": args.n_configs_eval, "test": n_test}
         mor_ladder = [float(m) for m in args.mor_ladder.split(",")]
-        rows = sample_plan(scenes_by_split, n_cfg, mor_ladder, args.global_seed, args.fps)
+        rows = sample_plan(scenes_by_split, n_cfg, mor_ladder, args.global_seed, args.fps,
+                           parse_mix(args.heterogeneity_mix))
         src_dir = {(r["split"], r["scene"]): os.path.join(split_roots[r["split"]], r["scene"]) for r in rows}
 
     frames_by_scene = {}
@@ -194,8 +226,8 @@ def main():
                                       clip_name(r["scene"], r["config_idx"], r["beta_base"]))
 
     os.makedirs(out_root, exist_ok=True)
-    write_manifest(rows, out_root)
-    print(f"[plan] {len(rows)} clip(s) over {len(src_dir)} scene(s) -> {out_root}/manifest.csv", flush=True)
+    write_manifest(rows, out_root, args.manifest_name)
+    print(f"[plan] {len(rows)} clip(s) over {len(src_dir)} scene(s) -> {out_root}/{args.manifest_name}", flush=True)
     for split in ("train", "val", "test"):
         mors = sorted(int(r["mor"]) for r in rows if r["split"] == split)
         if mors:
@@ -219,7 +251,8 @@ def main():
         if not frame_paths:
             print(f"WARNING: no frames for {split}/{scene} at {src_dir[(split, scene)]}", flush=True)
             continue
-        materialize_gt(frame_paths, os.path.join(out_root, split, "GT", scene), args.copy_gt)
+        frame_paths = materialize_gt(frame_paths, os.path.join(out_root, split, "GT", scene),
+                                     args.copy_gt, resize)
 
         todo = []
         for r in by_scene[(split, scene)]:
