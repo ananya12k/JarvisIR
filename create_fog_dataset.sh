@@ -20,6 +20,7 @@
 #   MOR_LADDER=300,200,150,100,75,50 sbatch create_fog_dataset.sh   # paper ladder only
 #   TEST_CONFIGS=8 sbatch create_fog_dataset.sh                     # every MOR on every test scene
 #   RESIZE=480x270 sbatch create_fog_dataset.sh                     # size of the shipped EDFog
+#   MAX_FRAMES=3500 sbatch create_fog_dataset.sh                    # cap long scenes like the shipped EDFog
 
 set -Eeuo pipefail
 echo "Running on $(hostname)"
@@ -39,6 +40,7 @@ VAL_CONFIGS="${VAL_CONFIGS:-2}"
 TEST_CONFIGS="${TEST_CONFIGS:-2}"
 SEED="${SEED:-edfog-8mor}"
 RESIZE="${RESIZE:-}"                                            # empty = native resolution
+MAX_FRAMES="${MAX_FRAMES:-0}"                                   # 0 = all frames of every scene
 NUM_GPUS="${NUM_GPUS:-$(nvidia-smi -L | wc -l)}"
 
 ARGS=(--engine_file "$JARVIS/fog_synthesis.py" --out_root "$OUT"
@@ -46,7 +48,7 @@ ARGS=(--engine_file "$JARVIS/fog_synthesis.py" --out_root "$OUT"
       --n_configs_train "$TRAIN_CONFIGS" --n_configs_eval "$VAL_CONFIGS" --n_configs_test "$TEST_CONFIGS"
       --mor_ladder "$MOR_LADDER" --heterogeneity_mix "$HET_MIX" --global_seed "$SEED"
       --vda_root /scratch/Ananya_Kulkarni/Video-Depth-Anything --encoder vits
-      --fps 30 --vda_batch 4 --vda_overlap 2 --skip_existing)
+      --max_frames "$MAX_FRAMES" --fps 30 --vda_batch 4 --vda_overlap 2 --skip_existing)
 [[ -n "$RESIZE" ]] && ARGS+=(--resize "$RESIZE")
 
 mkdir -p "$OUT"
